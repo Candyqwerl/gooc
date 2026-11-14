@@ -149,7 +149,7 @@ expr_get_by_symbol(
 
     ret = expr_get_by_symbol_from_table(global_expressions, symbol);
     if (!ret && version == 1) ret = expr_get_by_symbol_from_table(c1_expressions, symbol);
-    if (!ret && version == 2) ret = expr_get_by_symbol_from_table(c2_expressions, symbol);
+    if (!ret && is_post_c2(version)) ret = expr_get_by_symbol_from_table(c2_expressions, symbol);
 
     return ret;
 }
@@ -177,7 +177,7 @@ expr_get_by_id(
 
     ret = expr_get_by_id_from_table(global_expressions, id);
     if (!ret && version == 1) ret = expr_get_by_id_from_table(c1_expressions, id);
-    if (!ret && version == 2) ret = expr_get_by_id_from_table(c2_expressions, id);
+    if (!ret && is_post_c2(version)) ret = expr_get_by_id_from_table(c2_expressions, id);
 
     return ret;
 }

@@ -39,7 +39,6 @@
 #include "util.h"
 #include "value.h"
 
-
 static const id_format_pair_t th10_fmts[] = {
     { 0, "RR" },
     { 1, "RR" },
@@ -223,12 +222,12 @@ th10_find_format(
     return ret;
 }
 
-static const thecl_sub_t*
+static thecl_sub_t*
 th10_find_sub(
     thecl_t* ecl,
     const char* name)
 {
-    const thecl_sub_t* sub;
+    thecl_sub_t* sub;
     list_for_each(&ecl->subs, sub) {
         if (!strcmp(sub->name, name))
             return sub;
@@ -236,13 +235,13 @@ th10_find_sub(
     return NULL;
 }
 
-static const thecl_sub_t*
+static thecl_sub_t*
 th10_find_sub_overload(
     thecl_t* ecl,
     const char* name,
     int argc)
 {
-    const thecl_sub_t* sub;
+    thecl_sub_t* sub;
     list_for_each(&ecl->subs, sub) {
         if (!strcmp(sub->name, name) && sub->arg_count == argc)
             return sub;
@@ -250,12 +249,12 @@ th10_find_sub_overload(
     return NULL;
 }
 
-static const thecl_state_t*
+static thecl_state_t*
 c1_find_state(
     thecl_t* ecl,
     char* name)
 {
-    const thecl_state_t* state;
+    thecl_state_t* state;
     list_for_each(&ecl->states, state) {
         if (!strcmp(state->name, name))
             return state;
@@ -315,11 +314,13 @@ c1_parse(
     list_init(&state->delay_slots);
     list_init(&state->addresses);
     list_init(&state->block_stack);
+    list_init(&state->loop_frames);
     list_init(&state->expr_macros);
     state->scope_stack = NULL;
     state->scope_cnt = 0;
     state->scope_id = 0;
     state->current_sub = NULL;
+    state->current_state = NULL;
     state->ecl = thecl_new();
     state->ecl->version = version;
     state->main_ecl = state->ecl;
@@ -346,7 +347,8 @@ c1_parse(
     g_parser_state = state;
     yyin = in;
 
-    g_was_error = yyparse(state) != 0;
+    int parse_error = yyparse(state);
+    g_was_error = g_was_error || parse_error != 0;
 
     free(state->scope_stack);
     g_parser_state = NULL;
@@ -447,6 +449,7 @@ c1_instr_make_params(
     bool ignore_error,
     bool was_error)
 {
+    if (was_error && !ignore_error) g_was_error = true;
     int ret = 0;
     int total_bits = 0;
     int i = 0;
@@ -527,7 +530,7 @@ c1_instr_make_params(
                     val = c1_make_ref_special(param->value.val.S); /* sp-double ref OR null ref */
                 }
                 else if (param->object_link == -3) {
-                    val = c1_make_ref_pool(p + ecl->array_off); /* pool array ref */
+                    val = c1_make_ref_pool(p + ecl->eid_count); /* pool array ref */
                 }
             }
             else {
@@ -550,7 +553,7 @@ c1_instr_make_params(
             total_bits += 12;
         }
         else if (op == 'I') {
-            const char* next_format;
+            char* next_format;
             uint32_t b = strtol(format + i, &next_format, 10);
             i = next_format - format;
             val = p & (0xFFFFFFFFU >> (32 - b));
@@ -560,7 +563,7 @@ c1_instr_make_params(
             total_bits += b;
         }
         else if (op == 'N') {
-            const char* next_format;
+            char* next_format;
             uint32_t b = strtol(format + i, &next_format, 10);
             i = next_format - format;
             total_bits += b;
@@ -577,13 +580,13 @@ c1_instr_make_params(
             total_bits += 12;
         }
         else if (op == 'I') {
-            const char* next_format;
+            char* next_format;
             uint32_t b = strtol(format + i, &next_format, 10);
             i = next_format - format;
             total_bits += b;
         }
         else if (op == 'N') {
-            const char* next_format;
+            char* next_format;
             uint32_t b = strtol(format + i, &next_format, 10);
             i = next_format - format;
             total_bits += b;
@@ -688,6 +691,15 @@ c1_write_gool(
     entry_header->offsets[3] = file_tell(out);
 
     size_t pos = file_tell(out);
+
+    if (ecl->version == 2 || ecl->version == 3) {
+        int count = ecl->interrupt_count_override >= 0 ? ecl->interrupt_count_override : (ecl->version == 2 ? 80 : 81);
+        while (header->interrupt_count < count) {
+            uint16_t state_id = 255;
+            if (!file_write(out, &state_id, sizeof(uint16_t))) return 0;
+            ++header->interrupt_count;
+        }
+    }
     thecl_interrupt_t* interrupt;
     list_for_each(&ecl->interrupts, interrupt) {
         while (header->interrupt_count <= interrupt->event->offset) {
@@ -794,7 +806,14 @@ c1_compile_chain_common(
         return 0;
     }
 
-    entry_header_t entry_header = { 0x100FFFFU, parser->main_ecl->eid, 11U, 6U, { 0, 0, 0, 0, 0, 0, 0 } };
+    struct {
+        uint32_t magic;
+        uint32_t id;
+        uint32_t type;
+        uint32_t count;
+        uint32_t offsets[7];
+    } entry_header_buf = { 0x100FFFFU, parser->main_ecl->eid, 11U, 6U, { 0, 0, 0, 0, 0, 0, 0 } };
+    entry_header_t* entry_header = (entry_header_t*)&entry_header_buf;
     gool_header_t header = { parser->main_ecl->id, parser->main_ecl->type << 8, 1, parser->main_ecl->var_count + 0x40, 0, -1 };
     thecl_sub_t* sub;
     const thecl_state_t* state;
@@ -802,6 +821,18 @@ c1_compile_chain_common(
     gooc_array_t* arr;
 
     thecl_t* ecl = parser->main_ecl;
+
+    if ((ecl->version == 2 || ecl->version == 3) && ecl->interrupt_count_override >= 0) {
+        thecl_interrupt_t* interrupt;
+        list_for_each(&ecl->interrupts, interrupt) {
+            if (interrupt->event->offset >= ecl->interrupt_count_override) {
+                fprintf(stderr, "%s: event %s is outside #interruptcount %d\n",
+                    argv0, interrupt->event->name, ecl->interrupt_count_override);
+                g_was_error = true;
+                return 0;
+            }
+        }
+    }
 
     /* write GOOL EIDs to const pool before anything else */
     list_for_each(&ecl->states, state) {
@@ -839,6 +870,7 @@ c1_compile_chain_common(
             }
         }
     }
+    if (g_was_error) return 0;
     /* remove duplicates */
     for (int i = 0; i < parser->ecl_cnt + 1; ++i) {
         ecl = i == 0 ? parser->main_ecl : parser->ecl_stack[i - 1];
@@ -896,14 +928,15 @@ c1_compile_chain_common(
     }
     ecl = parser->main_ecl;
 
+    if (g_was_error) return 0;
     /* write file contents */
-    if (!c1_write_gool(ecl, &entry_header, &header, out)) return 0;
+    if (!c1_write_gool(ecl, entry_header, &header, out)) return 0;
 
     if (parser->ecl_cnt && !g_module_fmt) {
         fprintf(stderr, "%s: external module name format not specified\n", argv0);
     }
     else {
-        entry_header.count = 3;
+        entry_header->count = 3;
         for (int i = 0; i < parser->ecl_cnt; ++i) {
             ecl = parser->ecl_stack[i];
 
@@ -917,14 +950,14 @@ c1_compile_chain_common(
                 return 0;
             }
 
-            entry_header.id = ecl->eid;
+            entry_header->id = ecl->eid;
             header.exe_type = 0;
             header.eid_count = ecl->eid_count;
 
-            if (!file_write(out, &entry_header, sizeof(entry_header_t) + (entry_header.count + 1) * sizeof(uint32_t))) return 0;
-            entry_header.offsets[0] = file_tell(out);
+            if (!file_write(out, entry_header, sizeof(entry_header_t) + (entry_header->count + 1) * sizeof(uint32_t))) return 0;
+            entry_header->offsets[0] = file_tell(out);
             if (!file_write(out, &header, sizeof(gool_header_t))) return 0;
-            entry_header.offsets[1] = file_tell(out);
+            entry_header->offsets[1] = file_tell(out);
 
             list_for_each(&ecl->subs, sub) {
                 if (sub->forward_declaration || sub->is_inline)
@@ -937,16 +970,16 @@ c1_compile_chain_common(
                 if (!file_write(out, &sub->instr_data->data, sizeof(uint32_t) * sub->offset)) return 0;
             }
 
-            entry_header.offsets[2] = file_tell(out);
+            entry_header->offsets[2] = file_tell(out);
             if (!file_write(out, ecl->eids, sizeof(uint32_t) * ecl->eid_count)) return 0;
             list_for_each(&ecl->arrays, arr) {
                 if (!file_write(out, arr->data, sizeof(uint32_t) * (arr->end - arr->start))) return 0;
             }
             if (!file_write(out, ecl->consts, sizeof(uint32_t) * ecl->const_count)) return 0;
-            entry_header.offsets[3] = file_tell(out);
+            entry_header->offsets[3] = file_tell(out);
 
             if (!file_seek(out, 0)) return 0;
-            if (!file_write(out, &entry_header, sizeof(entry_header_t) + (entry_header.count + 1) * sizeof(uint32_t))) return 0;
+            if (!file_write(out, entry_header, sizeof(entry_header_t) + (entry_header->count + 1) * sizeof(uint32_t))) return 0;
 
             fclose(out);
         }
@@ -976,7 +1009,7 @@ c1_create_header(
     fprintf(out, "expr %s = %u\n\n", gool_to_ename(gool_name, gool->eid), gool->id);
 
     list_for_each(&gool->spawns, spawn) {
-        fprintf(out, "expr %s_%s = %u\n", gool_name, spawn->name, (int)spawn->offset);
+        fprintf(out, "expr %s_%s = %u\n", gool_name, spawn->name, (unsigned int)spawn->offset);
     }
 
     return 1;
@@ -1068,6 +1101,15 @@ const thecl_module_t c1_gool = {
 };
 
 const thecl_module_t c2_gool = {
+    .open = NULL,
+    .trans = NULL,
+    .dump = NULL,
+    .parse = c1_parse,
+    .compile = c2_compile,
+    .create_header = c1_create_header
+};
+
+const thecl_module_t c3_gool = {
     .open = NULL,
     .trans = NULL,
     .dump = NULL,

@@ -46,6 +46,7 @@
 #include "gool_ins.h"
 #include "c1_gool.h"
 #include "c2_gool.h"
+#include "c3_gool.h"
 #include "gmips.h"
 
 static thecl_instr_t* instr_new(parser_state_t* state, uint8_t id, const char* format, ...);
@@ -125,8 +126,15 @@ static void expression_optimize(parser_state_t* state, expression_t* expr);
     expression_load_new(state, param_null_new())
 
 static expression_t *expression_copy(expression_t *expr);
+static expression_t *expression_pointclip_getvert_new(parser_state_t *state, char *name, list_t *getvert_params, expression_t *clip_obj);
+static expression_t *expression_embedded_gool_ins_new(parser_state_t *state, char *name, list_t *params);
 static void expression_create_goto(parser_state_t *state, int type, char *labelstr, expression_t* cond);
 static void expression_create_goto_pop(parser_state_t *state, int type, char *labelstr, expression_t* cond, int pop);
+static list_node_t* block_stack_find_loop(parser_state_t *state);
+static void loop_frame_push(parser_state_t *state, const char *name);
+static void loop_frame_pop(parser_state_t *state, const char *name);
+static int loop_frame_stack_slots(parser_state_t *state, const char *name);
+static void loop_jump_create(parser_state_t *state, enum thecl_line_type line_type, const char *error_message);
 
 /* macros for expression_mips_operation */
 #define OutputExprToReg(EXPR, OP) \
@@ -168,6 +176,8 @@ static void objfield_delete(parser_state_t* state, const char* name);
 static thecl_variable_t* var_create(parser_state_t* state, thecl_sub_t* sub, const char* name, bool push);
 /* Creates a new variable in the specified subroutine, and assigns a value to it. */
 static thecl_variable_t* var_create_assign(parser_state_t* state, thecl_sub_t* sub, const char* name, expression_t* expr);
+
+static int var_get_new_stack(parser_state_t* state, thecl_sub_t* sub);
 /* Returns true if the given variable is accessible in the current scope.. */
 static bool var_accessible(parser_state_t* state, thecl_variable_t* var);
 /* Returns argument of the given name in the specified sub, or NULL if the argument doesn't exist */
@@ -188,6 +198,9 @@ static void var_assign(parser_state_t* state, thecl_param_t* param, expression_t
 static void var_shorthand_assign(parser_state_t* state, thecl_param_t* param, expression_t* expr, int EXPR);
 /* Stores a new label in the current subroutine pointing to the current offset. */
 static void label_create(parser_state_t* state, char* label);
+static void user_label_create(parser_state_t* state, const char* name);
+static void user_goto_create(parser_state_t* state, const char* name);
+static void user_gotos_resolve(parser_state_t* state);
 /* Returns the spawn of the given name, or NULL if it doesn't exist */
 static thecl_spawn_t* spawn_get(parser_state_t* state, const char* name);
 
@@ -208,6 +221,9 @@ static size_t anim_get_offset(parser_state_t* state, char* name);
 static void anim_create_anim_c1(parser_state_t* state, char* name, uint16_t frames, int eid);
 /* Appends a new Crash 2 vertex animation to the animations list. */
 static void anim_create_anim_c2(parser_state_t* state, char* name, uint16_t frames, int eid, int interp);
+static void anim_create_anim_c3(parser_state_t* state, char* name, uint16_t frames, int eid, int model, uint32_t interp, uint32_t number);
+static bool anim_validate_name(parser_state_t* state, char* name);
+static bool anim_validate_vertex(parser_state_t* state, char* name, int frames, unsigned int version);
 
 int yydebug = 0;
 %}
@@ -237,6 +253,10 @@ int yydebug = 0;
 %token <string> ENTRY "entry"
 %token <integer> ARRAY_NAME "array name"
 %token NIL "nil"
+%token INS74 "ins74"
+%token INS76 "ins76"
+%token INS79 "ins79"
+%token DIRECTIVE_ANIM "#anim"
 %token DIRECTIVE_FONT "#font"
 %token DIRECTIVE_CHAR "#char"
 %token DIRECTIVE_TEXT "#text"
@@ -290,6 +310,8 @@ int yydebug = 0;
 %token SAVE "save"
 %token EVHA "accev"
 %token EVHR "rejev"
+%token EVHAIF "accepteventif"
+%token EVHRIF "rejecteventif"
 %token AT "@"
 %token CALL
 %token LOAD
@@ -370,6 +392,8 @@ int yydebug = 0;
 %token ENTITYSTATEGET "entitygetstate"
 %token GAMEFUNC "gamefunc"
 %token GETVALIDEVENTOBJ "getvalideventobj"
+%token MISCFUNC "miscfunc"
+%token <integer> FUNCCONTEXT "function context operation"
 %token POINTCLIP "pointclip"
 %token UNK2 "__unk2"
 %token ISLOADED "isloaded"
@@ -388,15 +412,20 @@ int yydebug = 0;
 
 %type <expression> Expression
 %type <expression> ExpressionLoadType
+%type <expression> Func_Expression
+%type <expression> Miscfunc_Expression
 %type <expression> ExpressionSubset
 
 %type <param> Address
+%type <param> WriteAddress
 %type <param> Integer
 %type <param> Entry
 %type <param> Load_Type
 %type <param> Pointer_Type
 
 %type <integer> Signed_Int
+%type <string> Embedded_Instruction_Name
+%type <integer> EventIfKind
 
 %left QUESTION
 %right OR
@@ -484,6 +513,20 @@ Statement:
         list_append_new(&state->main_ecl->arrays, state->current_array);
         state->current_array = NULL;
       }
+    | DIRECTIVE INTEGER {
+        if (strcmp($1, "interruptcount")) {
+            yyerror(state, "unknown directive: #%s", $1);
+        } else if (state->version != 2 && state->version != 3) {
+            yyerror(state, "#interruptcount is only supported for Crash 2 and Crash 3");
+        } else if ($2 < 0) {
+            yyerror(state, "#interruptcount must be a nonnegative integer");
+        } else if (state->main_ecl->interrupt_count_override != -1) {
+            yyerror(state, "#interruptcount already declared");
+        } else {
+            state->main_ecl->interrupt_count_override = $2;
+        }
+        free($1);
+      }
     | DIRECTIVE IDENTIFIER INTEGER INTEGER {
         if (!strcmp($1, "gool")){
             state->main_ecl->eid = gool_to_eid($2);
@@ -518,25 +561,24 @@ Statement:
         free($2);
         free($3);
       }
-    | DIRECTIVE IDENTIFIER ENTRY INTEGER {
-        if (!strcmp($1, "anim")) {
-            if (state->version == 1) {
-                anim_create_anim_c1(state, $2, $4, gool_to_eid($3));
-            }
-        }
-        free($1);
+    | DIRECTIVE_ANIM IDENTIFIER ENTRY INTEGER {
+        if (anim_validate_vertex(state, $2, $4, 1))
+            anim_create_anim_c1(state, $2, $4, gool_to_eid($3));
         free($2);
         free($3);
       }
-    | DIRECTIVE IDENTIFIER ENTRY INTEGER INTEGER {
-        if (!strcmp($1, "anim")) {
-            if (state->version == 2) {
-                anim_create_anim_c2(state, $2, $4, gool_to_eid($3), $5);
-            }
-        }
-        free($1);
+    | DIRECTIVE_ANIM IDENTIFIER ENTRY INTEGER INTEGER {
+        if (anim_validate_vertex(state, $2, $4, 2))
+            anim_create_anim_c2(state, $2, $4, gool_to_eid($3), $5);
         free($2);
         free($3);
+      }
+    | DIRECTIVE_ANIM IDENTIFIER ENTRY ENTRY INTEGER INTEGER INTEGER {
+        if (anim_validate_vertex(state, $2, $5, 3))
+            anim_create_anim_c3(state, $2, $5, gool_to_eid($3), gool_to_eid($4), (uint32_t)$6, (uint32_t)$7);
+        free($2);
+        free($3);
+        free($4);
       }
     | DIRECTIVE TEXT {
         if (strcmp($1, "include") == 0) {
@@ -568,9 +610,13 @@ Statement:
             thecl_t* ecl = thecl_new();
             if (eid_pool_get_index(state->main_ecl, eid) == -1) {
                 state->main_ecl->eids = realloc(state->main_ecl->eids, (state->main_ecl->eid_count + 1) * sizeof(uint32_t));
-                memmove(state->main_ecl->eids+state->ecl_cnt+2, state->main_ecl->eids+state->ecl_cnt+1, state->main_ecl->eid_count++);
+
+                memmove(state->main_ecl->eids+state->ecl_cnt+2, state->main_ecl->eids+state->ecl_cnt+1,
+                    (state->main_ecl->eid_count - state->ecl_cnt - 1) * sizeof(uint32_t));
+                ++state->main_ecl->eid_count;
                 state->main_ecl->eids[state->ecl_cnt+1] = eid;
             }
+            ecl->version = state->version;
             ecl->eid = eid;
             state->ecl = ecl;
             state->ecl_stack = realloc(state->ecl_stack, sizeof(thecl_t*) * ++state->ecl_cnt);
@@ -590,6 +636,7 @@ Statement:
         free($1);
     }
     | DIRECTIVE_FONT IDENTIFIER ENTRY {
+        anim_validate_name(state, $2);
         gool_anim_t* anim = malloc(sizeof(gool_anim_t));
         anim->name = strdup($2);
 
@@ -600,7 +647,7 @@ Statement:
             font->eid = gool_to_eid($3);
             anim->size = sizeof(c1_font_t);
             anim->anim = font;
-        } else if (state->version == 2) {
+        } else if (is_post_c2(state->version)) {
             c2_font_t* font = malloc(sizeof(c2_font_t));
             font->type = 3;
             font->char_count = 0;
@@ -618,6 +665,7 @@ Statement:
         state->current_anim = NULL;
       }
     | DIRECTIVE_SPRITE IDENTIFIER ENTRY {
+        anim_validate_name(state, $2);
         gool_anim_t* anim = malloc(sizeof(gool_anim_t));
         anim->name = strdup($2);
 
@@ -628,7 +676,7 @@ Statement:
             sprite->count = 0;
             sprite->eid = gool_to_eid($3);
             anim->anim = sprite;
-        } else if (state->version == 2) {
+        } else if (is_post_c2(state->version)) {
             anim->size = sizeof(c2_sprite_t);
             c2_sprite_t* sprite = malloc(sizeof(c2_sprite_t));
             sprite->type = 2;
@@ -646,6 +694,7 @@ Statement:
         state->current_anim = NULL;
       }
     | DIRECTIVE_TEXT IDENTIFIER IDENTIFIER ENTRY {
+        anim_validate_name(state, $2);
         gool_anim_t* anim = malloc(sizeof(gool_anim_t));
         anim->name = strdup($2);
         anim->size = sizeof(c1_text_t);
@@ -667,6 +716,7 @@ Statement:
         state->current_anim = NULL;
       }
     | DIRECTIVE_FANIM IDENTIFIER ENTRY INTEGER {
+        anim_validate_name(state, $2);
         gool_anim_t* anim = malloc(sizeof(gool_anim_t));
         anim->name = strdup($2);
 
@@ -701,8 +751,18 @@ Statement:
         }
         else {
             c2_fraganim_t* fraganim = state->current_anim->anim;
-            ++fraganim->sprite_count;
-            fraganim->sprite_count /= fraganim->frag_count;
+            if (state->version == 3) {
+                if (!fraganim->frag_count || fraganim->sprite_count % fraganim->frag_count) {
+                    yyerror(state, "%s: fragment count must be positive and divide the number of fragments", state->current_anim->name);
+                    g_was_error = true;
+                } else {
+                    fraganim->sprite_count /= fraganim->frag_count;
+                }
+            } else {
+
+                ++fraganim->sprite_count;
+                fraganim->sprite_count /= fraganim->frag_count;
+            }
         }
 
         list_append_new(&state->main_ecl->anims, state->current_anim);
@@ -837,7 +897,7 @@ Base_Texture_Info:
             tex->unk2 = 0;
             tex->textured = !(!uv && !tex->r && !tex->g && !tex->b && !tex->color && !tex->blend && !tex->cx && !tex->cy && !tex->x && !tex->y && !tex->segment);
         }
-        else if (state->version == 2) {
+        else if (is_post_c2(state->version)) {
             c2_tex_t* tex = state->current_tex;
 
             int x = $x;
@@ -887,6 +947,25 @@ Base_Texture_Info:
 
 Texture_Info:
       Base_Texture_Info
+    | Base_Texture_Info "{" INTEGER[u1] INTEGER[v1] INTEGER[u2] INTEGER[v2] INTEGER[u3] INTEGER[v3] INTEGER[u4] INTEGER[v4] "}" {
+
+        if (state->version != 2 && state->version != 3) {
+            yyerror(state, "explicit UV corners require Crash 2 or Crash 3");
+            g_was_error = true;
+        } else if ($u1 < 0 || $u1 > 255 || $u2 < 0 || $u2 > 255 ||
+                   $u3 < 0 || $u3 > 255 || $u4 < 0 || $u4 > 255 ||
+                   $v1 < 0 || $v1 > 127 || $v2 < 0 || $v2 > 127 ||
+                   $v3 < 0 || $v3 > 127 || $v4 < 0 || $v4 > 127) {
+            yyerror(state, "explicit UV corners are out of bounds");
+            g_was_error = true;
+        } else {
+            c2_tex_t* tex = state->current_tex;
+            tex->u1 = $u1; tex->v1 = $v1;
+            tex->u2 = $u2; tex->v2 = $v2;
+            tex->u3 = $u3; tex->v3 = $v3;
+            tex->u4 = $u4; tex->v4 = $v4;
+        }
+      }
     | Base_Texture_Info "!" INTEGER[wind] INTEGER[flip] {
         if (state->version == 1) {
             c1_tex_t* tex = state->current_tex;
@@ -895,7 +974,7 @@ Texture_Info:
             tex->uv = tex->uv & 0x3FF;
             tex->textured = tex->textured || tex->uv;
         }
-        else if (state->version == 2) {
+        else if (is_post_c2(state->version)) {
         }
       }
     ;
@@ -915,7 +994,7 @@ Font_Char:
             c1_char_t* character = font->chars + font->char_count - 1;
             state->current_tex = &character->tex;
         }
-        else if (state->version == 2) {
+        else if (is_post_c2(state->version)) {
             c2_font_t* font = state->current_anim->anim;
             state->current_anim->anim = font = realloc(font, sizeof(c2_font_t) + sizeof(c2_char_t) * ++font->char_count);
             state->current_anim->size = sizeof(c2_font_t) + sizeof(c2_char_t) * font->char_count;
@@ -929,7 +1008,7 @@ Font_Char:
             c1_char_t* character = font->chars + font->char_count - 1;
             character->w = $w;
             character->h = $h;
-        } else if (state->version == 2) {
+        } else if (is_post_c2(state->version)) {
             c2_font_t* font = state->current_anim->anim;
             c2_char_t* character = font->chars + font->char_count - 1;
             character->w = $w;
@@ -952,7 +1031,7 @@ Sprite_Frame:
 
             c1_tex_t* tex = sprite->frames + sprite->count - 1;
             state->current_tex = tex;
-        } else if (state->version == 2) {
+        } else if (is_post_c2(state->version)) {
             c2_sprite_t* sprite = state->current_anim->anim;
             state->current_anim->anim = sprite = realloc(sprite, sizeof(c2_sprite_t) + sizeof(c2_tex_t) * ++sprite->count);
             state->current_anim->size = sizeof(c2_sprite_t) + sizeof(c2_tex_t) * sprite->count;
@@ -994,19 +1073,19 @@ Frag:
         if (state->version == 1) {
             state->current_anim->anim = realloc(state->current_anim->anim, state->current_anim->size + sizeof(c1_frag_t));
             c1_fraganim_t* fraganim = state->current_anim->anim;
-            c1_frag_t* frag = (char*)fraganim + state->current_anim->size;
+            c1_frag_t* frag = (c1_frag_t*)((char*)fraganim + state->current_anim->size);
             state->current_tex = &frag->tex;
         }
-        else if (state->version == 2) {
+        else if (is_post_c2(state->version)) {
             state->current_anim->anim = realloc(state->current_anim->anim, state->current_anim->size + sizeof(c2_frag_t));
             c2_fraganim_t* fraganim = state->current_anim->anim;
-            c2_frag_t* frag = (char*)fraganim + state->current_anim->size;
+            c2_frag_t* frag = (c2_frag_t*)((char*)fraganim + state->current_anim->size);
             state->current_tex = &frag->tex;
         }
       } Texture_Info Signed_Int[x] Signed_Int[y] Signed_Int[w] Signed_Int[h] {
         if (state->version == 1) {
             c1_fraganim_t* fraganim = state->current_anim->anim;
-            c1_frag_t* frag = (char*)fraganim + state->current_anim->size;
+            c1_frag_t* frag = (c1_frag_t*)((char*)fraganim + state->current_anim->size);
             frag->x = $x;
             frag->y = $y;
             frag->w = $w;
@@ -1014,9 +1093,9 @@ Frag:
             state->current_anim->size += sizeof(c1_frag_t);
             ++fraganim->sprite_count;
         }
-        else if (state->version == 2) {
+        else if (is_post_c2(state->version)) {
             c2_fraganim_t* fraganim = state->current_anim->anim;
-            c2_frag_t* frag = (char*)fraganim + state->current_anim->size;
+            c2_frag_t* frag = (c2_frag_t*)((char*)fraganim + state->current_anim->size);
             frag->x = $x;
             frag->y = $y;
             frag->w = $w;
@@ -1188,7 +1267,7 @@ State_Subroutine_Identifier:
 
 Instructions:
     %empty
-    /*| Instructions IDENTIFIER ":" { label_create(state, $2); free($2); }*/
+    | Instructions IDENTIFIER ":" { user_label_create(state, $2); free($2); }
     | Instructions Instruction
     | Instructions Block
     ;
@@ -1221,6 +1300,7 @@ DoParenExpressionList:
 
 Block:
       IfBlock
+    | EventIfBlock
     | WhileBlock
     | CodeBlock
     | OnceBlock
@@ -1274,7 +1354,7 @@ SaveBlock:
             }
             int count = list_count($3);
             state->current_sub->stack_offset += count;
-            list_append_new(&state->addresses, count);
+            list_append_new(&state->addresses, (void*)(intptr_t)count);
             free($3);
         }
       } CodeBlock {
@@ -1282,7 +1362,7 @@ SaveBlock:
             list_append_new(&state->current_sub->lines, line_make_save_end());
         }
         else {
-            int m = list_tail(&state->addresses);
+            int m = (int)(intptr_t)list_tail(&state->addresses);
             list_del_tail(&state->addresses);
 
             const expr_t* local_expr = expr_get_by_symbol(state->version, ASSIGN);
@@ -1330,6 +1410,47 @@ OnceBlock:
 CodeBlock:
     "{" { scope_begin(state); } Instructions "}" { scope_finish(state, true); }
     | Instruction_NoVar ";"
+    ;
+
+EventIfKind:
+      "accepteventif" { $$ = 1; }
+    | "rejecteventif" { $$ = 0; }
+    ;
+
+EventIfBlock:
+    EventIfKind "(" Expression ")" {
+        if (!state->current_state || !state->current_state->event ||
+            !state->current_state->event->lambda_name ||
+            strcmp(state->current_state->event->lambda_name, state->current_sub->name)) {
+            yyerror(state, "accept/rejecteventif is only permitted within event blocks");
+            exit(2);
+        }
+        if (state->current_sub->arg_count != 2) {
+            yyerror(state, "accept/rejecteventif requires an event block with two parameters");
+            exit(2);
+        }
+        if (state->mips_mode) {
+            yyerror(state, "accept/rejecteventif is not supported in mips mode");
+            exit(2);
+        }
+
+        char labelstr[256];
+        snprintf(labelstr, sizeof(labelstr), "eventif_%i_%i", yylloc.first_line, yylloc.first_column);
+        list_prepend_new(&state->block_stack, strdup(labelstr));
+        expression_output(state, $3);
+        expression_free($3);
+
+        thecl_param_t* target = param_new('o');
+        target->value.type = 'z';
+        target->value.val.z = strdup(labelstr);
+        const gool_ins_t* ins = gool_ins_get_by_name(state->version, $1 ? "accev" : "rejev");
+        instr_add(state, state->current_sub, instr_new(state, ins->id, "pSpSS", target, 0, param_sp_new(), 1, 0));
+      } CodeBlock ElseBlock {
+        list_node_t* head = state->block_stack.head;
+        label_create(state, head->data);
+        free(head->data);
+        list_del(&state->block_stack, head);
+      }
     ;
 
 IfBlock:
@@ -1441,6 +1562,7 @@ WhileBlock:
         label_create(state, labelstr_st);
 
         list_prepend_new(&state->block_stack, strdup(labelstr));
+        loop_frame_push(state, labelstr);
       } CodeBlock {
         if (state->ignore_block) {
             --state->ignore_block;
@@ -1472,6 +1594,7 @@ WhileBlock:
         list_free_nodes($cond);
         label_create(state, labelstr_end);
 
+        loop_frame_pop(state, head->data);
         free(head->data);
         list_del(&state->block_stack, head);
         scope_finish(state, true);
@@ -1512,6 +1635,7 @@ WhileBlock:
         label_create(state, labelstr_st);
 
         list_prepend_new(&state->block_stack, strdup(labelstr));
+        loop_frame_push(state, labelstr);
       } CodeBlock {
         if (state->ignore_block) {
             --state->ignore_block;
@@ -1542,6 +1666,7 @@ WhileBlock:
         list_free_nodes($cond);
         label_create(state, labelstr_end);
 
+        loop_frame_pop(state, head->data);
         free(head->data);
         list_del(&state->block_stack, head);
         scope_finish(state, true);
@@ -1555,6 +1680,7 @@ WhileBlock:
         snprintf(labelstr_end, 256, "%s_end", (char*)labelstr);
 
         list_prepend_new(&state->block_stack, strdup(labelstr));
+        loop_frame_push(state, labelstr);
         label_create(state, labelstr_st);
       } DoBlock { scope_finish(state, true); }
     ;
@@ -1590,6 +1716,7 @@ DoBlock:
         list_free_nodes($cond);
         label_create(state, labelstr_end);
 
+        loop_frame_pop(state, head->data);
         free(head->data);
         list_del(&state->block_stack, head);
       }
@@ -1623,9 +1750,16 @@ DoBlock:
         list_free_nodes($cond);
         label_create(state, labelstr_end);
 
+        loop_frame_pop(state, head->data);
         free(head->data);
         list_del(&state->block_stack, head);
       }
+    ;
+
+Embedded_Instruction_Name:
+      "ins74" { $$ = strdup("ins74"); }
+    | "ins76" { $$ = strdup("ins76"); }
+    | "ins79" { $$ = strdup("ins79"); }
     ;
 
 Instruction_NoVar:
@@ -1660,57 +1794,42 @@ Instruction_NoVar:
         }
         free($1);
       }
-    /*| "goto" IDENTIFIER {
-        expression_create_goto(state, GOTO, $2, NULL);
-    }*/
+    | Embedded_Instruction_Name "(" Expression_List ")" {
+        const gool_ins_t* ins = gool_ins_get_by_name(state->version, $1);
+        if (!ins) {
+            yyerror(state, "%s is not supported in Crash %u", $1, state->version);
+            g_was_error = true;
+        }
+        if (ins && state->current_sub->is_inline) {
+            list_append_new(&state->current_sub->lines, line_make_call($1, $3));
+        }
+        else {
+            if (ins) instr_create_gool_ins(state, ins, $3);
+            if ($3) {
+                expression_t* expr;
+                list_for_each($3, expr) expression_free(expr);
+                list_free_nodes($3);
+                free($3);
+            }
+        }
+        free($1);
+      }
+    | Func_Expression { expression_output(state, $1); expression_free($1); }
+    | "miscfunc" "(" Miscfunc_Expression "," Miscfunc_Expression "," Miscfunc_Expression "," Miscfunc_Expression ")" {
+        expression_t* expr = EXPR_4(MISC, $3, $5, $7, $9);
+        expression_output(state, expr);
+        expression_free(expr);
+      }
+    | "goto" IDENTIFIER {
+        user_goto_create(state, $2);
+        free($2);
+      }
     | Assignment
     | "break" {
-        if (state->current_sub->is_inline) {
-            list_append_new(&state->current_sub->lines, line_make(LINE_BREAK));
-        }
-        else {
-            list_node_t *head = state->block_stack.head;
-            for(; head; head = head->next) {
-                if (
-                    strncmp(head->data, "do", 2) == 0 ||
-                    strncmp(head->data, "while", 5) == 0 ||
-                    strncmp(head->data, "until", 5) == 0
-                ) {
-                    char labelstr[256];
-                    snprintf(labelstr, 256, "%s_end", (char*)head->data);
-                    expression_create_goto(state, GOTO, labelstr, NULL);
-                    break;
-                }
-            }
-            if(!head) {
-                yyerror(state, "break not within while or until");
-                g_was_error = true;
-            }
-        }
+        loop_jump_create(state, LINE_BREAK, "break not within while or until");
       }
     | "continue" {
-        if (state->current_sub->is_inline) {
-            list_append_new(&state->current_sub->lines, line_make(LINE_CONTINUE));
-        }
-        else {
-            list_node_t *head = state->block_stack.head;
-            for(; head; head = head->next) {
-                if (
-                    strncmp(head->data, "do", 2) == 0 ||
-                    strncmp(head->data, "while", 5) == 0 ||
-                    strncmp(head->data, "until", 5) == 0
-                ) {
-                    char labelstr[256];
-                    snprintf(labelstr, 256, "%s_continue", (char*)head->data);
-                    expression_create_goto(state, GOTO, labelstr, NULL);
-                    break;
-                }
-            }
-            if(!head) {
-                yyerror(state, "continue not within while or until");
-                g_was_error = true;
-            }
-        }
+        loop_jump_create(state, LINE_CONTINUE, "continue not within while or until");
       }
     | "return" {
         if (state->current_sub->is_inline) {
@@ -1752,26 +1871,68 @@ Instruction:
     ;
 
 Assignment:
-      Address "=" Expression {
+      WriteAddress "=" Expression {
         if ($1->type == 'o') {
             yyerror(state, "invalid address: %s", $1->value.val.z);
             return 0;
         }
         var_assign(state, $1, $3);
       }
-    | Address "+=" Expression { var_shorthand_assign(state, $1, $3, ADD); }
-    | Address "-=" Expression { var_shorthand_assign(state, $1, $3, SUBTRACT); }
-    | Address "*=" Expression { var_shorthand_assign(state, $1, $3, MULTIPLY); }
-    | Address "/=" Expression { var_shorthand_assign(state, $1, $3, DIVIDE); }
-    | Address "%=" Expression { var_shorthand_assign(state, $1, $3, MODULO); }
-    | Address "^=" Expression { var_shorthand_assign(state, $1, $3, XOR); }
-    | Address "|=" Expression { var_shorthand_assign(state, $1, $3, B_OR); }
-    | Address "&=" Expression { var_shorthand_assign(state, $1, $3, B_AND); }
-    | Address "<<=" Expression { var_shorthand_assign(state, $1, $3, LSHIFT); }
-    | Address ">>=" Expression { var_shorthand_assign(state, $1, $3, RSHIFT); }
-    | Address "\\=" Expression { var_shorthand_assign(state, $1, $3, TEST); }
+    | Address "[" Expression "]" "=" Expression {
+        if (state->version != 3 || state->mips_mode) {
+            yyerror(state, "indexed assignment requires C3 GOOL mode");
+            g_was_error = true;
+        }
+        else {
+            list_t* args = list_new();
+            list_append_new(args, expression_load_new(state, $1));
+            list_append_new(args, $3);
+            list_append_new(args, $6);
+            if (state->current_sub->is_inline) {
+                list_append_new(&state->current_sub->lines, line_make_call(strdup("setval"), args));
+            }
+            else {
+                instr_create_gool_ins(state, gool_ins_get_by_name(state->version, "setval"), args);
+                expression_t* arg;
+                list_for_each(args, arg) expression_free(arg);
+                list_free_nodes(args);
+                free(args);
+            }
+        }
+      }
+    | WriteAddress "+=" Expression { var_shorthand_assign(state, $1, $3, ADD); }
+    | WriteAddress "-=" Expression { var_shorthand_assign(state, $1, $3, SUBTRACT); }
+    | WriteAddress "*=" Expression { var_shorthand_assign(state, $1, $3, MULTIPLY); }
+    | WriteAddress "/=" Expression { var_shorthand_assign(state, $1, $3, DIVIDE); }
+    | WriteAddress "%=" Expression { var_shorthand_assign(state, $1, $3, MODULO); }
+    | WriteAddress "^=" Expression { var_shorthand_assign(state, $1, $3, XOR); }
+    | WriteAddress "|=" Expression { var_shorthand_assign(state, $1, $3, B_OR); }
+    | WriteAddress "&=" Expression { var_shorthand_assign(state, $1, $3, B_AND); }
+    | WriteAddress "<<=" Expression { var_shorthand_assign(state, $1, $3, LSHIFT); }
+    | WriteAddress ">>=" Expression { var_shorthand_assign(state, $1, $3, RSHIFT); }
+    | WriteAddress "\\=" Expression { var_shorthand_assign(state, $1, $3, TEST); }
     ;
 
+WriteAddress:
+      Address { $$ = $1; }
+    | MACRO {
+        expression_t* expr = macro_get(state, $1)->expr;
+        if (!((expr->type == EXPRESSION_VAL || expr->type == EXPRESSION_XVAL
+                || expr->type == EXPRESSION_GLOBAL || expr->type == EXPRESSION_COLOR)
+                && expr->value && expr->value->type == 'S'
+                && (expr->value->val_type == PARAM_GLOBAL
+                    || expr->value->val_type == PARAM_COLOR
+                    || (expr->value->val_type == PARAM_FIELD
+                        && expr->value->object_link != -2)))) {
+            yyerror(state, "expression '%s' is not a writable field alias", $1);
+            free($1);
+            YYABORT;
+        }
+
+        $$ = param_copy(expr->value);
+        free($1);
+      }
+    ;
 Address_List:
     %empty { $$ = NULL; }
     | Address { $$ = list_new(); list_append_new($$, $1); }
@@ -1782,6 +1943,28 @@ Expression_List:
     %empty { $$ = NULL; }
     | Expression { $$ = list_new(); list_append_new($$, $1); }
     | Expression_List "," Expression { $$ = $1; list_append_new($$, $3); }
+    ;
+
+Func_Expression:
+      FUNCCONTEXT "(" Miscfunc_Expression ")" {
+        if (state->version != 2 && state->version != 3) {
+            yyerror(state, "getfunc/setfunc/pushfunc are only supported in C2/C3");
+            g_was_error = true;
+        }
+        $$ = EXPR_4(MISC, $3, EXPR_VAL(0), EXPR_VAL($1), EXPR_VAL(12));
+      }
+    | FUNCCONTEXT "(" Miscfunc_Expression "," Miscfunc_Expression ")" {
+        if (state->version != 2 && state->version != 3) {
+            yyerror(state, "getfunc/setfunc/pushfunc are only supported in C2/C3");
+            g_was_error = true;
+        }
+        $$ = EXPR_4(MISC, $3, $5, EXPR_VAL($1), EXPR_VAL(12));
+      }
+    ;
+
+Miscfunc_Expression:
+      Expression
+    | IDENTIFIER "(" Expression_List ")" { $$ = expression_embedded_gool_ins_new(state, $1, $3); }
     ;
 
 Expression:
@@ -1796,7 +1979,8 @@ ExpressionLoadType:
 
 /* This is the lowest common denominator between expression-instructions and expression-parameters */
 ExpressionSubset:
-      MACRO { $$ = expression_copy(macro_get(state, $1)->expr); }
+      Func_Expression
+    | MACRO { $$ = expression_copy(macro_get(state, $1)->expr); }
     |          "(" Expression ")" { $$ = $2; }
     | Expression "+"   Expression { $$ = EXPR_2(ADD,      $1, $3); }
     | Expression "-"   Expression { $$ = EXPR_2(SUBTRACT, $1, $3); }
@@ -1823,7 +2007,7 @@ ExpressionSubset:
     | "-" Expression %prec USUBTRACT { $$ = EXPR_2(SUBTRACT, EXPR_VAL(0), $2); }
     | "abs" "(" Expression ")"       { $$ = EXPR_2(ABS,      EXPR_SP(), $3); }
     | "getanim" "(" Expression ")"   { $$ = EXPR_2(GETANIM,  EXPR_SP(), $3); }
-    | "getglobal" "(" Expression ")" { $$ = EXPR_1(GETGLOBAL,$3, EXPR_NULL()); }
+    | "getglobal" "(" Expression ")" { $$ = EXPR_1(GETGLOBAL,$3); }
     | "seek" "(" Expression "," Expression "," Expression ")"     { $$ = EXPR_3(SEEK, $3, $5, $7); }
     | "seek" "(" Expression "," Expression ")"                    { $$ = EXPR_2(SEEK, $3, $5); }
     | "degseek" "(" Expression "," Expression "," Expression ")"  { $$ = EXPR_3(DEGSEEK, $3, $5, $7); }
@@ -1857,11 +2041,12 @@ ExpressionSubset:
                                                                     else $$ = EXPR_2(ARRL, expression_load_new(state, $1), $3);
                                                                   }
     | "getval" "(" Expression "," Expression ")"                  { if (!is_post_c2(state->version)) $$ = EXPR_4(MISC, $3, EXPR_VAL(5), $5, EXPR_VAL(0));
-                                                                    else $$ = EXPR_2(ARRL, expression_load_new(state, $3), $5);
+                                                                    else $$ = EXPR_2(ARRL, $3, $5);
                                                                   }
     | "distance" "(" Expression ")"                               { $$ = EXPR_4(MISC, EXPR_NULL(), $3, EXPR_VAL(0), EXPR_VAL(1)); }
     | "distance" "(" Expression "," Expression ")"                { $$ = EXPR_4(MISC, EXPR_NULL(), $3, $5, EXPR_VAL(1)); }
     | "atan" "(" Expression "," Expression ")"                    { $$ = EXPR_2(ATAN, $3, $5); }
+    | "atan2" "(" Expression "," Expression "," Expression ")"    { $$ = EXPR_4(MISC, $5, $3, $7, EXPR_VAL(2)); }
     | "atan2" "(" Expression "," Expression ")"                   { $$ = EXPR_4(MISC, $5, $3, EXPR_VAL(0), EXPR_VAL(2)); }
     | "atan2" "(" Expression ")"                                  { $$ = EXPR_4(MISC, $3, EXPR_VAL(0), EXPR_VAL(0), EXPR_VAL(2)); }
     | "getfield" "(" Expression "," Expression ")" {
@@ -1880,7 +2065,10 @@ ExpressionSubset:
     | "atan2_3d" "(" Expression "," Expression ")"                { $$ = EXPR_4(MISC, $5, $3, EXPR_VAL(8), EXPR_VAL(12)); }
     | "getvalideventobj" "(" Expression "," Expression "," Expression ")"   { $$ = EXPR_4(MISC, $3, $5, $7, EXPR_VAL(13)); }
     | "getvalideventobj" "(" Expression "," Expression ")"        { $$ = EXPR_4(MISC, $3, EXPR_VAL(0), $5, EXPR_VAL(13)); }
-    | "pointclip" "(" Expression "," Expression ")"               { if (!is_post_c2(state->version)) $$ = EXPR_4(MISC, $3, $5, EXPR_VAL(0), EXPR_VAL(14)); }
+
+    | "miscfunc" "(" Miscfunc_Expression "," Miscfunc_Expression "," Miscfunc_Expression "," Miscfunc_Expression ")" { $$ = EXPR_4(MISC, $3, $5, $7, $9); }
+    | "pointclip" "(" Expression "," Expression ")"               { $$ = EXPR_4(MISC, $3, $5, EXPR_VAL(0), EXPR_VAL(14)); }
+    | "pointclip" "(" IDENTIFIER "(" Expression_List ")" "," Expression ")" { $$ = expression_pointclip_getvert_new(state, $3, $5, $8); }
 //  | "__unk2" "(" Expression "," Expression ")"                  { if (!is_post_c2(state->version)) $$ = EXPR_4(MISC, $3, EXPR_VAL(0), $5, EXPR_VAL(15)); }
     | "isloaded" "(" Expression_List ")"                          {
         if ($3 == NULL) {
@@ -1918,6 +2106,7 @@ ExpressionSubset:
         }
       }
     | "getfreepages" "(" ")"                                      { $$ = EXPR_2(NTRY, EXPR_NULL(), EXPR_VAL(4)); }
+    | Embedded_Instruction_Name "(" Expression_List ")" { $$ = expression_embedded_gool_ins_new(state, $1, $3); }
     | "getins" "(" Expression ")"                                 { $$ = EXPR_3(MOVC, $3, EXPR_VAL(0), EXPR_VAL(0x1F)); }
 
     /* Custom expressions. */
@@ -1952,7 +2141,8 @@ Address:
         if (var_exists(state, state->current_sub, $1)) {
             $$ = param_new('S');
             $$->val_type = PARAM_FIELD;
-            $$->value.val.S = var_stack(state, state->current_sub, $1) + state->current_sub->stack_offset;
+            $$->value.val.S = var_stack(state, state->current_sub, $1)
+                + (state->mips_mode ? state->current_sub->stack_offset : 0);
         } else if (arg = arg_get(state, state->current_sub, $1)) {
             $$ = param_new('S');
             $$->val_type = PARAM_FIELD;
@@ -1981,7 +2171,7 @@ Address:
             $$->object_link = 0;
         } else if (spawn = spawn_get(state, $1)) {
             $$ = param_new('S');
-            $$->value.val.S = spawn->offset;
+            $$->value.val.S = gool_spawn_value(state->main_ecl, spawn);
         } else if ((anim_offset = anim_get_offset(state, $1)) != 0xFFFF) {
             $$ = param_new('S');
             $$->value.val.S = anim_offset << 8;
@@ -1991,6 +2181,32 @@ Address:
             $$->value.val.z = strdup($1);
         }
         free($1);
+      }
+    | IDENTIFIER "->" MACRO {
+        const field_t* link = field_get($1);
+        expression_t* expr = macro_get(state, $3)->expr;
+        if (!link || link->offset < 0 || link->offset >= 8) {
+            yyerror(state, "invalid object link: %s", $1);
+            free($1);
+            free($3);
+            YYABORT;
+        }
+        if (!((expr->type == EXPRESSION_VAL || expr->type == EXPRESSION_XVAL
+                || expr->type == EXPRESSION_COLOR)
+                && expr->value && expr->value->type == 'S'
+                && (expr->value->val_type == PARAM_FIELD
+                    || expr->value->val_type == PARAM_COLOR)
+                && expr->value->object_link == 0)) {
+            yyerror(state, "expression '%s' is not an unlinked object field alias", $3);
+            free($1);
+            free($3);
+            YYABORT;
+        }
+
+        $$ = param_copy(expr->value);
+        $$->object_link = link->offset;
+        free($1);
+        free($3);
       }
     | IDENTIFIER "->" IDENTIFIER {
         const field_t* color = NULL, *objfield = NULL;
@@ -2061,6 +2277,12 @@ Pointer_Type:
       "&" Load_Type {
         $$ = $2;
         $$->val_type = PARAM_POINTER;
+      }
+    | ARRAY_NAME "[" Signed_Int "]" {
+        $$ = param_new('S');
+        $$->val_type = PARAM_POINTER;
+        $$->value.val.S = $1 + $3;
+        $$->object_link = -3;
       }
     | ARRAY_NAME {
         $$ = param_new('S');
@@ -2514,7 +2736,7 @@ instr_add(
                     if (param->val_type == PARAM_LITERAL) {
                         list_del_tail(&sub->last_ins->params);
                         thecl_param_t* branch_type_param = (thecl_param_t*)instr->params.tail->prev->data;
-                        int branch_type = state->version == 2 ? instr->id - bra_expr->id - 1 : branch_type_param->value.val.S - 1;
+                        int branch_type = is_post_c2(state->version) ? instr->id - bra_expr->id - 1 : branch_type_param->value.val.S - 1;
                         if (--sub->last_ins->param_count == 0) {
                             list_del_tail(&sub->instrs);
                             thecl_instr_free(sub->last_ins);
@@ -2686,6 +2908,16 @@ param_adjust_inline_stack(
 {
     if (param->val_type == PARAM_FIELD && param->object_link == -1 && param->value.val.S >= 3) {
         param->value.val.S += stack_adjust;
+
+        if (!state->current_sub->is_inline && !state->mips_mode) {
+            for (size_t i = 0; i < state->current_sub->var_count; ++i) {
+                thecl_variable_t* var = state->current_sub->vars[i];
+                if (!var->is_unused && var->stack == param->value.val.S) {
+                    param->value.val.S += var->save_offset;
+                    break;
+                }
+            }
+        }
     }
     return param;
 }
@@ -2719,7 +2951,7 @@ expression_cascade_func(
     void* args)
 {
     func(state, expr, args);
-    if (expr->type == EXPRESSION_OP || expr->type == EXPRESSION_TERNARY) {
+    if (expr->type == EXPRESSION_OP || expr->type == EXPRESSION_TERNARY || expr->type == EXPRESSION_POINTCLIP_GETVERT || expr->type == EXPRESSION_EMBEDDED_GOOL_INS) {
         expression_t* e;
         list_for_each(&expr->children, e) {
             expression_cascade_func(state, e, func, args);
@@ -2812,10 +3044,14 @@ instr_create_inline_call(
     }
 
     scope_begin(state);
+    state->scope_stack[state->scope_cnt - 1].inline_owner = state->scope_stack[state->scope_cnt - 1].id;
+    if (state->current_sub->is_inline)
+        ((thecl_line_t*)list_tail(&state->current_sub->lines))->type = LINE_INLINE_SCOPE_START;
 
     /* This string will be prepended to label names/var names etc. */
     char name[256], buf[512];
-    snprintf(name, 256, "%s_%d_%d_%s_", state->current_sub->name, yylloc.first_line, yylloc.first_column, sub->name);
+    static unsigned long inline_instance = 0;
+    snprintf(name, 256, "%s_%d_%d_%s_%lu_", state->current_sub->name, yylloc.first_line, yylloc.first_column, sub->name, inline_instance++);
 
     int stack_adjust = var_get_new_stack(state, state->current_sub)-3;
     thecl_line_t* line;
@@ -2823,11 +3059,48 @@ instr_create_inline_call(
         switch (line->type) {
             default: yyerror(state, "invalid line type in sub '%s'", state->current_sub->name); break;
             case LINE_ASSIGNMENT: {
-                var_assign(state, param_adjust_inline_stack(state, param_copy(line->ass.address), stack_adjust), inline_call_replace_params(state, line->ass.expr, params_org, stack_adjust));
+                thecl_param_t* address = line->ass.address;
+                if (address->val_type == PARAM_FIELD && address->object_link == -1 && address->value.val.S < 0) {
+
+                    int slot = -1;
+                    expression_t* actual;
+                    thecl_param_t* destination = NULL;
+                    if (params_org) {
+                        list_for_each_back(params_org, actual) {
+                            if (slot-- != address->value.val.S) continue;
+                            if ((actual->type == EXPRESSION_VAL || actual->type == EXPRESSION_XVAL
+                                    || actual->type == EXPRESSION_GLOBAL || actual->type == EXPRESSION_COLOR)
+                                    && actual->value && actual->value->type == 'S'
+                                    && (actual->value->val_type == PARAM_GLOBAL
+                                        || actual->value->val_type == PARAM_COLOR
+                                        || (actual->value->val_type == PARAM_FIELD
+                                            && actual->value->object_link != -2)))
+                                destination = param_copy(actual->value);
+                            break;
+                        }
+                    }
+                    if (!destination) {
+                        yyerror(state, "inline sub '%s': written argument must be a writable field or variable", sub->name);
+                        g_was_error = true;
+                        break;
+                    }
+                    address = destination;
+                }
+                else {
+                    address = param_adjust_inline_stack(state, param_copy(address), stack_adjust);
+                }
+                var_assign(state, address, inline_call_replace_params(state, line->ass.expr, params_org, stack_adjust));
             } break;
             case LINE_LABEL: {
                 snprintf(buf, 512, "%s%s", name, line->name);
                 label_create(state, buf);
+            } break;
+            case LINE_USER_LABEL: {
+                user_label_create(state, line->name);
+            } break;
+            case LINE_USER_GOTO: {
+
+                user_goto_create(state, line->go.label);
             } break;
             case LINE_INSTRUCTION:
             case LINE_CALL: {
@@ -2864,8 +3137,14 @@ instr_create_inline_call(
                     }
                 }
             } break;
-            case LINE_SCOPE_START: {
+            case LINE_SCOPE_START:
+            case LINE_INLINE_SCOPE_START: {
                 scope_begin(state);
+                if (line->type == LINE_INLINE_SCOPE_START) {
+                    state->scope_stack[state->scope_cnt - 1].inline_owner = state->scope_stack[state->scope_cnt - 1].id;
+                    if (state->current_sub->is_inline)
+                        ((thecl_line_t*)list_tail(&state->current_sub->lines))->type = LINE_INLINE_SCOPE_START;
+                }
             } break;
             case LINE_SCOPE_END: {
                 scope_finish(state, true);
@@ -2879,60 +3158,12 @@ instr_create_inline_call(
                 var_create_assign(state, state->current_sub, buf, inline_call_replace_params(state, line->var.expr, params_org, stack_adjust));
             } break;
             case LINE_BREAK: {
-                if (state->current_sub->is_inline) {
-                    list_append_new(&state->current_sub->lines, line_make(LINE_BREAK));
-                }
-                else {
-                    list_node_t *head = state->block_stack.head;
-                    for(; head; head = head->next) {
-                        if (strncmp(head->data, "do", 2) == 0 ||
-                            strncmp(head->data, "while", 5) == 0 ||
-                            strncmp(head->data, "until", 5) == 0
-                        ) {
-                            char labelstr[256];
-                            snprintf(labelstr, 256, "%s_end", (char*)head->data);
-                            expression_create_goto(state, GOTO, labelstr, NULL);
-                            break;
-                        }
-                    }
-                    if(!head) {
-                        yyerror(state, "break not within while or until");
-                        g_was_error = true;
-                    }
-                }
+                loop_jump_create(state, LINE_BREAK, "break not within while or until");
             } break;
             case LINE_CONTINUE: {
-                if (state->current_sub->is_inline) {
-                    list_append_new(&state->current_sub->lines, line_make(LINE_CONTINUE));
-                }
-                else {
-                    list_node_t *head = state->block_stack.head;
-                    for(; head; head = head->next) {
-                        if (strncmp(head->data, "do", 2) == 0 ||
-                            strncmp(head->data, "while", 5) == 0 ||
-                            strncmp(head->data, "until", 5) == 0
-                        ) {
-                            char labelstr[256];
-                            snprintf(labelstr, 256, "%s_continue", (char*)head->data);
-                            expression_create_goto(state, GOTO, labelstr, NULL);
-                            break;
-                        }
-                    }
-                    if(!head) {
-                        yyerror(state, "break not within while or until");
-                        g_was_error = true;
-                    }
-                }
+                loop_jump_create(state, LINE_CONTINUE, "continue not within while or until");
             } break;
-            case LINE_RETURN: {
-                if (state->current_sub->is_inline) {
-                    list_append_new(&state->current_sub->lines, line_make(LINE_RETURN));
-                }
-                else {
-                    snprintf(buf, 512, "%s%s", name, "inline_end");
-                    expression_create_goto_pop(state, GOTO, buf, NULL, var_get_new_stack(state, state->current_sub)-(stack_adjust+3));
-                }
-            } break;
+            case LINE_RETURN:
             case LINE_RETURN_SUP: {
                 if (state->current_sub->is_inline) {
                     list_append_new(&state->current_sub->lines, line_make(LINE_RETURN_SUP));
@@ -2948,7 +3179,12 @@ instr_create_inline_call(
             } break;
             case LINE_SAVE_START: {
                 if (state->current_sub->is_inline) {
-                    list_append_new(&state->current_sub->lines, line_make_save_start(line->list));
+                    list_t* addresses = list_new();
+                    thecl_param_t* address;
+                    list_for_each(line->list, address) {
+                        list_append_new(addresses, param_adjust_inline_stack(state, param_copy(address), stack_adjust));
+                    }
+                    list_append_new(&state->current_sub->lines, line_make_save_start(addresses));
                 }
                 else {
                     const expr_t* local_expr = expr_get_by_symbol(state->version, LOAD);
@@ -2966,7 +3202,7 @@ instr_create_inline_call(
                     }
                     int count = list_count(line->list);
                     state->current_sub->stack_offset += count;
-                    list_append_new(&state->addresses, count);
+                    list_append_new(&state->addresses, (void*)(intptr_t)count);
                 }
             } break;
             case LINE_SAVE_END: {
@@ -2974,7 +3210,7 @@ instr_create_inline_call(
                     list_append_new(&state->current_sub->lines, line_make_save_end());
                 }
                 else {
-                    int m = list_tail(&state->addresses);
+                    int m = (int)(intptr_t)list_tail(&state->addresses);
                     list_del_tail(&state->addresses);
 
                     const expr_t* local_expr = expr_get_by_symbol(state->version, ASSIGN);
@@ -3031,11 +3267,114 @@ instr_create_call(
 }
 
 static void
+instr_create_rank(parser_state_t* state, const gool_ins_t* ins, list_t* params)
+{
+    bool get = !strcmp(ins->name, "getrank");
+    if (state->mips_mode || !params || list_count(params) != 4) {
+        yyerror(state, "%s requires four arguments in C3 GOOL mode", ins->name);
+        g_was_error = true;
+        return;
+    }
+    expression_t* args[4];
+    int i = 0;
+    expression_t* operand;
+    list_for_each(params, operand) args[i++] = operand;
+    if (get) {
+        for (i = 1; i < 4; ++i) {
+            thecl_param_t* dest = args[i]->value;
+            if (args[i]->type != EXPRESSION_VAL || !dest || dest->type != 'S' ||
+                dest->val_type != PARAM_FIELD || !var_is_valid_field_ref(state, dest) ||
+                dest->object_link < -1 ||
+                (dest->object_link == 0 && dest->value.val.S == 0x1F)) {
+                yyerror(state, "getrank: arguments 2 through 4 must be writable GOOL fields or locals");
+                g_was_error = true;
+                return;
+            }
+        }
+    }
+    else {
+
+        state->block_bound = 1;
+        expression_output(state, args[1]);
+        state->block_bound = 1;
+        expression_output(state, args[2]);
+        expression_output(state, args[3]);
+    }
+    expression_t* operation = EXPR_4(MISC, expression_copy(args[0]),
+        EXPR_VAL(5), EXPR_VAL(get ? 19 : 20), EXPR_VAL(15));
+    expression_output(state, operation);
+    expression_free(operation);
+    if (get) {
+        for (i = 1; i < 4; ++i)
+            var_assign(state, param_copy(args[i]->value), EXPR_SP());
+    }
+
+}
+
+static void
 instr_create_gool_ins(
     parser_state_t* state,
     const gool_ins_t* gool_ins,
     list_t* params)
 {
+    if ((state->version == 3 && !strcmp(gool_ins->name, "misc5")) || (is_post_c2(state->version) && !strcmp(gool_ins->name, "print"))) {
+        bool misc = !strcmp(gool_ins->name, "misc5");
+        int count = params ? list_count(params) : 0;
+        if (state->mips_mode || (misc ? (count != 2 && count != 3) : count != 2)) {
+            yyerror(state, "%s requires %s arguments in %s GOOL mode", gool_ins->name, misc ? "two or three" : "two", misc ? "C3" : "C2/C3");
+            g_was_error = true;
+            return;
+        }
+        if (misc) {
+            expression_t* args[3];
+            expression_t* arg;
+            int i = 0;
+            list_for_each(params, arg) args[i++] = arg;
+            thecl_param_t* dest = args[0]->value;
+            if (args[0]->type != EXPRESSION_VAL || !dest || dest->val_type != PARAM_FIELD ||
+                !var_is_valid_field_ref(state, dest) || dest->object_link < -1 ||
+                (dest->object_link == 0 && dest->value.val.S == 0x1F)) {
+                yyerror(state, "misc5: first argument must be a direct GOOL field or local");
+                g_was_error = true;
+                return;
+            }
+            if (count == 3 && (args[2]->type != EXPRESSION_VAL || !args[2]->value ||
+                args[2]->value->val_type != PARAM_LITERAL || args[2]->value->value.val.S < 0 ||
+                args[2]->value->value.val.S > 31)) {
+                yyerror(state, "misc5: mode must be an integer literal from 0 through 31");
+                g_was_error = true;
+                return;
+            }
+            expression_output(state, args[1]);
+            expression_t* operation = EXPR_4(MISC, expression_copy(args[0]), EXPR_VAL(5),
+                count == 3 ? expression_copy(args[2]) : EXPR_VAL(0), EXPR_VAL(5));
+            expression_output(state, operation);
+            expression_free(operation);
+            return;
+        }
+    }
+
+    if (state->version == 3 && (!strcmp(gool_ins->name, "getrank") || !strcmp(gool_ins->name, "setrank"))) {
+        instr_create_rank(state, gool_ins, params);
+        return;
+    }
+
+    if (state->version == 3 && gool_ins->id >= 79 && gool_ins->id <= 81) {
+        bool valid = !state->mips_mode && params && list_count(params) == 2;
+        expression_t* operand;
+        if (params) {
+            list_for_each(params, operand) {
+                if (operand->type != EXPRESSION_VAL || operand->id != expr_get_by_symbol(state->version, LOAD)->id)
+                    valid = false;
+            }
+        }
+        if (!valid) {
+            yyerror(state, "%s requires two direct GOOL references in GOOL mode", gool_ins->name);
+            g_was_error = true;
+            return;
+        }
+    }
+
     list_t* param_list = list_new();
     list_t* arg_list = list_new();
 
@@ -3240,10 +3579,87 @@ expression_ternary_new(
 {
     expression_t* expr = malloc(sizeof(expression_t));
     expr->type = EXPRESSION_TERNARY;
+    expr->id = 0;
+    expr->is_inline_arg = false;
+    expr->value = NULL;
     list_init(&expr->children);
     list_append_new(&expr->children, cond);
     list_append_new(&expr->children, val1);
     list_append_new(&expr->children, val2);
+    return expr;
+}
+
+static expression_t *
+expression_pointclip_getvert_new(
+    parser_state_t* state,
+    char* name,
+    list_t* getvert_params,
+    expression_t* clip_obj)
+{
+    expression_t* expr = malloc(sizeof(expression_t));
+    expr->type = EXPRESSION_POINTCLIP_GETVERT;
+    expr->id = 0;
+    expr->is_inline_arg = false;
+    expr->value = NULL;
+    list_init(&expr->children);
+
+    if (strcmp(name, "getvert") != 0) {
+        yyerror(state, "pointclip only supports nested getvert expressions");
+        g_was_error = true;
+    }
+
+    size_t getvert_param_count = getvert_params ? list_count(getvert_params) : 0;
+    if (getvert_param_count != 3) {
+        yyerror(state, "getvert: wrong number of arguments (expected 3, got %zu)", getvert_param_count);
+        g_was_error = true;
+    }
+
+    expression_t* child_expr;
+    if (getvert_params) {
+        list_for_each(getvert_params, child_expr) {
+            list_append_new(&expr->children, child_expr);
+        }
+        list_free_nodes(getvert_params);
+        free(getvert_params);
+    }
+    while (list_count(&expr->children) < 3) {
+        list_append_new(&expr->children, EXPR_VAL(0));
+    }
+    free(name);
+
+    list_append_new(&expr->children, clip_obj);
+    return expr;
+}
+
+static expression_t *
+expression_embedded_gool_ins_new(
+    parser_state_t* state,
+    char* name,
+    list_t* params)
+{
+    expression_t* expr = malloc(sizeof(expression_t));
+    expr->type = EXPRESSION_EMBEDDED_GOOL_INS;
+    expr->id = 0;
+    expr->is_inline_arg = false;
+    expr->value = param_new('z');
+    expr->value->value.type = 'z';
+    expr->value->value.val.z = name;
+    list_init(&expr->children);
+
+    if (!gool_ins_get_by_name(state->version, name)) {
+        yyerror(state, "embedded instruction not found: %s", name);
+        g_was_error = true;
+    }
+
+    expression_t* child_expr;
+    if (params) {
+        list_for_each(params, child_expr) {
+            list_append_new(&expr->children, child_expr);
+        }
+        list_free_nodes(params);
+        free(params);
+    }
+
     return expr;
 }
 
@@ -3255,10 +3671,13 @@ expression_copy(
     memcpy(copy, expr, sizeof(expression_t));
     expression_t* child_expr;
     list_init(&copy->children);
-    if (expr->type == EXPRESSION_OP || expr->type == EXPRESSION_TERNARY) {
+    if (expr->type == EXPRESSION_OP || expr->type == EXPRESSION_TERNARY || expr->type == EXPRESSION_POINTCLIP_GETVERT || expr->type == EXPRESSION_EMBEDDED_GOOL_INS) {
         list_for_each(&expr->children, child_expr)
             list_append_new(&copy->children, expression_copy(child_expr));
     } else if (expr->type == EXPRESSION_VAL || expr->type == EXPRESSION_XVAL) {
+        copy->value = param_copy(expr->value);
+    }
+    if (expr->type == EXPRESSION_EMBEDDED_GOOL_INS) {
         copy->value = param_copy(expr->value);
     }
     return copy;
@@ -3320,6 +3739,100 @@ expression_create_goto_pop(
             }
         }
         instr_add(state, state->current_sub, instr_new(state, expr_get_by_symbol(state->version, type)->id, "pSpSS", p1, pop, pcond, type == GOTO ? 0 : (type == IF ? 1 : (type == UNLESS ? 2 : 3)), 0));
+    }
+}
+
+static list_node_t*
+block_stack_find_loop(
+    parser_state_t *state)
+{
+    list_node_t *head = state->block_stack.head;
+    for (; head; head = head->next) {
+        if (strncmp(head->data, "do", 2) == 0 ||
+            strncmp(head->data, "while", 5) == 0 ||
+            strncmp(head->data, "until", 5) == 0
+        ) {
+            return head;
+        }
+    }
+    return NULL;
+}
+
+static void
+loop_frame_push(
+    parser_state_t *state,
+    const char *name)
+{
+    gooc_loop_frame_t *frame = malloc(sizeof(gooc_loop_frame_t));
+    frame->name = strdup(name);
+    frame->stack_slots = var_get_new_stack(state, state->current_sub) - 3
+        + state->current_sub->stack_offset;
+    list_prepend_new(&state->loop_frames, frame);
+}
+
+static void
+loop_frame_pop(
+    parser_state_t *state,
+    const char *name)
+{
+    list_node_t *node;
+    list_node_t *next;
+    list_for_each_node_safe(&state->loop_frames, node, next) {
+        gooc_loop_frame_t *frame = node->data;
+        if (!strcmp(frame->name, name)) {
+            list_del(&state->loop_frames, node);
+            free(frame->name);
+            free(frame);
+            return;
+        }
+    }
+}
+
+static int
+loop_frame_stack_slots(
+    parser_state_t *state,
+    const char *name)
+{
+    gooc_loop_frame_t *frame;
+    list_for_each(&state->loop_frames, frame) {
+        if (!strcmp(frame->name, name)) {
+            return frame->stack_slots;
+        }
+    }
+    return var_get_new_stack(state, state->current_sub) - 3
+        + state->current_sub->stack_offset;
+}
+
+static void
+loop_jump_create(
+    parser_state_t *state,
+    enum thecl_line_type line_type,
+    const char *error_message)
+{
+    list_node_t *head = block_stack_find_loop(state);
+    const char *suffix = line_type == LINE_CONTINUE ? "continue" : "end";
+
+    if (head) {
+        char labelstr[256];
+        snprintf(labelstr, 256, "%s_%s", (char*)head->data, suffix);
+        if (state->current_sub->is_inline) {
+            list_append_new(&state->current_sub->lines, line_make_goto(GOTO, strdup(labelstr), NULL));
+        }
+        else {
+            int current_slots = var_get_new_stack(state, state->current_sub) - 3
+                + state->current_sub->stack_offset;
+            int pop = state->mips_mode ? 0 : current_slots - loop_frame_stack_slots(state, head->data);
+            expression_create_goto_pop(state, GOTO, labelstr, NULL, pop);
+        }
+        return;
+    }
+
+    if (state->current_sub->is_inline) {
+        list_append_new(&state->current_sub->lines, line_make(line_type));
+    }
+    else {
+        yyerror(state, error_message);
+        g_was_error = true;
     }
 }
 
@@ -3886,6 +4399,46 @@ expression_output(
     parser_state_t* state,
     expression_t* expr)
 {
+    if (expr->type == EXPRESSION_POINTCLIP_GETVERT) {
+        const gool_ins_t* getvert = gool_ins_get_by_name(state->version, "getvert");
+        list_t params;
+        list_init(&params);
+        list_append_new(&params, list_head(&expr->children));
+        list_append_new(&params, expr->children.head->next->data);
+        list_append_new(&params, expr->children.head->next->next->data);
+        instr_create_gool_ins(state, getvert, &params);
+        list_free_nodes(&params);
+
+        expression_t* clip_obj = expr->children.tail->data;
+        expression_t* pointclip = EXPR_4(MISC, expression_load_new(state, param_var_new("vec")), expression_copy(clip_obj), EXPR_VAL(0), EXPR_VAL(14));
+        expression_output(state, pointclip);
+        expression_free(pointclip);
+        return;
+    }
+    else if (expr->type == EXPRESSION_EMBEDDED_GOOL_INS) {
+        if (state->mips_mode) {
+            yyerror(state, "embedded GOOL instructions are not supported in MIPS mode");
+            exit(2);
+        }
+
+        const char* name = expr->value->value.val.z;
+        const gool_ins_t* gool_ins = gool_ins_get_by_name(state->version, (char*)name);
+        if (!gool_ins) {
+            yyerror(state, "embedded instruction not found: %s", name);
+            exit(2);
+        }
+
+        list_t params;
+        list_init(&params);
+        expression_t* child_expr;
+        list_for_each(&expr->children, child_expr) {
+            list_append_new(&params, child_expr);
+        }
+        instr_create_gool_ins(state, gool_ins, &params);
+        list_free_nodes(&params);
+        return;
+    }
+
     if (expr->type != EXPRESSION_TERNARY && expr_get_by_id(state->version, expr->id)->id < -2) {
         yyerror(state, "error, cannot output non-compileable expression %d", expr->id);
         exit(2);
@@ -4335,6 +4888,8 @@ sub_begin(
     sub->secondlast_ins = NULL;
     sub->mips_dirty = false;
     list_init(&sub->labels);
+    list_init(&sub->user_labels);
+    list_init(&sub->user_gotos);
 
     list_append_new(&state->ecl->subs, sub);
 
@@ -4383,6 +4938,7 @@ sub_finish(
                 instr_return_mips(state, state->current_sub);
             }
         }
+        user_gotos_resolve(state);
         state->ecl->ins_offset += state->current_sub->offset;
     }
 
@@ -4394,17 +4950,22 @@ static void
 scope_begin(
     parser_state_t* state
 ) {
-    if (state->current_sub && state->current_sub->is_inline && state->scope_cnt > 0) {
-        list_append_new(&state->current_sub->lines, line_make(LINE_SCOPE_START));
-        return;
-    }
 
-    kill_delay_slots(state, state->current_sub);
+    if (state->current_sub && state->current_sub->is_inline) {
+        if (state->scope_cnt > 0)
+            list_append_new(&state->current_sub->lines, line_make(LINE_SCOPE_START));
+    }
+    else {
+        kill_delay_slots(state, state->current_sub);
+    }
 
     state->scope_stack = realloc(state->scope_stack, sizeof(thecl_scope_t)*(state->scope_cnt+1));
     state->scope_stack[state->scope_cnt].id = state->scope_id++;
     state->scope_stack[state->scope_cnt].mips = state->scope_cnt >= 1 ? state->scope_stack[state->scope_cnt - 1].mips : state->mips_mode;
     state->scope_stack[state->scope_cnt].returned = false;
+    state->scope_stack[state->scope_cnt].saved_slots = state->current_sub ? state->current_sub->stack_offset : 0;
+    state->scope_stack[state->scope_cnt].inline_owner = state->scope_cnt
+        ? state->scope_stack[state->scope_cnt - 1].inline_owner : -1;
     ++state->scope_cnt;
     state->block_bound = 1;
 }
@@ -4414,8 +4975,15 @@ scope_finish(
     parser_state_t* state,
     bool pop_vars
 ) {
-    if (state->current_sub && state->current_sub->is_inline && pop_vars) {
-        list_append_new(&state->current_sub->lines, line_make(LINE_SCOPE_END));
+    if (state->current_sub && state->current_sub->is_inline) {
+        if (pop_vars)
+            list_append_new(&state->current_sub->lines, line_make(LINE_SCOPE_END));
+
+        for (int v = 0; v < state->current_sub->var_count; ++v)
+            if (state->current_sub->vars[v]->scope == state->scope_stack[state->scope_cnt - 1].id)
+                state->current_sub->vars[v]->is_unused = true;
+        state->scope_stack = realloc(state->scope_stack, sizeof(thecl_scope_t) * --state->scope_cnt);
+        state->block_bound = 1;
         return;
     }
 
@@ -4478,6 +5046,7 @@ arg_create(
 
     thecl_variable_t* arg = malloc(sizeof(thecl_variable_t));
     arg->name = strdup(name);
+    arg->save_offset = 0;
     arg->is_unused = false;
     arg->is_written = false;
 
@@ -4570,6 +5139,7 @@ var_create(
     thecl_variable_t* var = malloc(sizeof(thecl_variable_t));
     var->name = strdup(name);
     var->stack = var_get_new_stack(state, sub);
+    var->save_offset = sub->stack_offset;
     var->is_unused = false;
     var->is_written = false;
     var->scope = state->scope_stack[state->scope_cnt - 1].id;
@@ -4693,7 +5263,7 @@ var_stack(
 {
     thecl_variable_t* var = var_get(state, sub, name);
     if (var != NULL)
-        return var->stack;
+        return var->stack + (state->mips_mode ? 0 : var->save_offset);
 
     yyerror(state, "variable not found: %s", name);
     return 0;
@@ -4723,16 +5293,32 @@ var_exists(
 }
 
 static void
+var_mark_written(parser_state_t* state, const thecl_param_t* param)
+{
+    if (param->val_type != PARAM_FIELD || param->object_link != -1)
+        return;
+    thecl_sub_t* sub = state->current_sub;
+    if (param->value.val.S < 0) {
+        sub->args[-param->value.val.S - 1]->is_written = true;
+        return;
+    }
+
+    for (size_t i = 0; i < sub->var_count; ++i) {
+        thecl_variable_t* var = sub->vars[i];
+        if (!var->is_unused && var->stack + var->save_offset == param->value.val.S) {
+            var->is_written = true;
+            return;
+        }
+    }
+}
+
+static void
 var_assign(
     parser_state_t* state,
     thecl_param_t* param,
     expression_t* expr_assign)
 {
     if (state->current_sub->is_inline) {
-        if (param->val_type == PARAM_FIELD && param->object_link == -1 && param->value.val.S < 0) {
-            yyerror(state, "inline subs cannot write to their arguments");
-            exit(2);
-        }
         list_append_new(&state->current_sub->lines, line_make_assignment(param, expr_assign));
         return;
     }
@@ -4741,12 +5327,7 @@ var_assign(
     if (var_is_valid_field_ref(state, param) && src_param && src_param->value.val.S == 0x1F && src_param->val_type == PARAM_FIELD && src_param->object_link == 0) {
         src_param->value.val.S = param->value.val.S;
         src_param->object_link = param->object_link;
-        if (param->object_link == -1 && param->value.val.S - state->current_sub->stack_offset >= 3) {
-            state->current_sub->vars[param->value.val.S - state->current_sub->stack_offset - 3]->is_written = true;
-        }
-        else if (param->object_link == -1 && param->value.val.S < 0) {
-            state->current_sub->args[-param->value.val.S - 1]->is_written = true;
-        }
+        var_mark_written(state, param);
         param_free(param);
         expression_output(state, expr_assign);
         expression_free(expr_assign);
@@ -4788,12 +5369,7 @@ var_assign(
         if (var_is_valid_field_ref(state, param)) {
             instr_add(state, state->current_sub, instr_new(state, expr_get_by_symbol(state->version, src_param->val_type == PARAM_POINTER ? PASSIGN : ASSIGN)->id, "pp", param, src_param));
 
-            if (param->object_link == -1 && param->value.val.S - state->current_sub->stack_offset >= 3) {
-                state->current_sub->vars[param->value.val.S - state->current_sub->stack_offset - 3]->is_written = true;
-            }
-            else if (param->object_link == -1 && param->value.val.S < 0) {
-                state->current_sub->args[-param->value.val.S - 1]->is_written = true;
-            }
+            var_mark_written(state, param);
         } else if (param->val_type == PARAM_GLOBAL) { /* WGL */
             instr_add(state, state->current_sub, instr_new(state, expr_get_by_symbol(state->version, GASSIGN)->id, "Sp", param->value.val.S, src_param));
         } else if (param->val_type == PARAM_COLOR) { /* CVMW */
@@ -4871,6 +5447,248 @@ mips_instr_new_store(
         }
     }
     SetUsedReg(state->top_reg);
+}
+
+typedef struct {
+    char* name;
+    int line;
+    int scope_count;
+    int* scopes;
+    int var_count;
+    thecl_variable_t** vars;
+    int saved_slots;
+    int save_owner;
+    int inline_owner;
+    thecl_instr_t* instr;
+    bool resolved;
+} user_jump_point_t;
+
+static user_jump_point_t*
+user_jump_point_new(parser_state_t* state, const char* name)
+{
+    user_jump_point_t* point = calloc(1, sizeof(*point));
+    point->name = strdup(name);
+    point->line = yylloc.first_line;
+    point->scope_count = state->scope_cnt;
+    point->scopes = malloc(sizeof(int) * point->scope_count);
+    for (int i = 0; i < point->scope_count; ++i)
+        point->scopes[i] = state->scope_stack[i].id;
+    point->vars = malloc(sizeof(*point->vars) * state->current_sub->var_count);
+    for (size_t i = 0; i < state->current_sub->var_count; ++i) {
+        thecl_variable_t* var = state->current_sub->vars[i];
+        if (!var->is_unused) point->vars[point->var_count++] = var;
+    }
+    point->saved_slots = state->current_sub->stack_offset;
+    point->save_owner = -1;
+    for (int i = 0; i < state->scope_cnt; ++i) {
+        int outer_slots = i ? state->scope_stack[i - 1].saved_slots : 0;
+        if (state->scope_stack[i].saved_slots != outer_slots)
+            point->save_owner = state->scope_stack[i].id;
+    }
+    point->inline_owner = state->scope_stack[state->scope_cnt - 1].inline_owner;
+    return point;
+}
+
+static char*
+user_label_name(const char* name, int scope)
+{
+    char* result = malloc(strlen(name) + 32);
+    sprintf(result, "@!user:%d:%s", scope, name);
+    return result;
+}
+
+static void
+user_label_create(parser_state_t* state, const char* name)
+{
+    if (state->current_sub->is_inline) {
+        thecl_line_t* line = line_make_label(strdup(name));
+        line->type = LINE_USER_LABEL;
+        list_append_new(&state->current_sub->lines, line);
+        return;
+    }
+    if (state->ignore_block || state->mips_mode) {
+        yyerror(state, "label '%s' requires reachable GOOL code", name);
+        g_was_error = true;
+        return;
+    }
+    user_jump_point_t* point;
+    list_for_each(&state->current_sub->user_labels, point) {
+        if (!strcmp(point->name, name) &&
+            point->scopes[point->scope_count - 1] == state->scope_stack[state->scope_cnt - 1].id) {
+            yyerror(state, "duplicate label '%s' (first declared at line %d)", name, point->line);
+            g_was_error = true;
+            return;
+        }
+    }
+    list_append_new(&state->current_sub->user_labels, user_jump_point_new(state, name));
+    char* internal_name = user_label_name(name, state->scope_stack[state->scope_cnt - 1].id);
+    label_create(state, internal_name);
+    free(internal_name);
+    state->block_bound = 1;
+}
+
+static void
+user_goto_create(parser_state_t* state, const char* name)
+{
+    if (state->current_sub->is_inline) {
+        thecl_line_t* line = line_make_goto(GOTO, strdup(name), NULL);
+        line->type = LINE_USER_GOTO;
+        list_append_new(&state->current_sub->lines, line);
+        return;
+    }
+    if (state->ignore_block) return;
+    if (state->mips_mode) {
+        yyerror(state, "goto '%s' is not supported in MIPS code", name);
+        g_was_error = true;
+        return;
+    }
+    user_jump_point_t* point = user_jump_point_new(state, name);
+    char* internal_name = user_label_name(name, state->scope_stack[state->scope_cnt - 1].id);
+    state->block_bound = 1;
+    expression_create_goto(state, GOTO, internal_name, NULL);
+    free(internal_name);
+    point->instr = state->current_sub->last_ins;
+    list_append_new(&state->current_sub->user_gotos, point);
+    state->block_bound = 1;
+}
+
+static void
+user_goto_fold(parser_state_t* state, user_jump_point_t* jump)
+{
+    thecl_sub_t* sub = state->current_sub;
+    list_node_t* node;
+    list_for_each_node(&sub->instrs, node) {
+        if (node->data == jump->instr) break;
+    }
+    if (!node || !node->prev) return;
+    thecl_instr_t* branch = node->prev->data;
+    int if_id = expr_get_by_symbol(state->version, IF)->id;
+    int unless_id = expr_get_by_symbol(state->version, UNLESS)->id;
+    if (branch->mips || (branch->id != if_id && branch->id != unless_id) || branch->param_count != 5)
+        return;
+    thecl_param_t* dest = branch->params.head->data;
+    thecl_param_t* pop = branch->params.head->next->data;
+    thecl_param_t* kind = branch->params.tail->prev->data;
+    thecl_param_t* action = branch->params.tail->data;
+    if (dest->type != 'o' || pop->value.val.S || action->value.val.S ||
+        (!is_post_c2(state->version) && kind->value.val.S != 1 && kind->value.val.S != 2))
+        return;
+    thecl_label_t* label;
+    bool skips_jump = false;
+    list_for_each(&sub->labels, label) {
+        if (label->offset == jump->instr->offset) return;
+        if (!strcmp(label->name, dest->value.val.z) && label->offset == jump->instr->offset + 1)
+            skips_jump = true;
+    }
+    if (!skips_jump) return;
+    thecl_param_t* jump_dest = jump->instr->params.head->data;
+    thecl_param_t* jump_pop = jump->instr->params.head->next->data;
+    free(dest->value.val.z);
+    dest->value.val.z = strdup(jump_dest->value.val.z);
+    pop->value.val.S = jump_pop->value.val.S;
+    if (is_post_c2(state->version))
+        branch->id = branch->id == if_id ? unless_id : if_id;
+    kind->value.val.S = is_post_c2(state->version) ? (branch->id == if_id ? 1 : 2) : 3 - kind->value.val.S;
+    instr_del(state, sub, jump->instr);
+    thecl_instr_free(jump->instr);
+    jump->instr = branch;
+}
+
+static void
+user_gotos_resolve(parser_state_t* state)
+{
+    thecl_sub_t* sub = state->current_sub;
+    if (list_empty(&sub->user_gotos) && list_empty(&sub->user_labels)) return;
+    bool native = false;
+    thecl_instr_t* instr;
+    list_for_each(&sub->instrs, instr) {
+        if (instr->mips) native = true;
+    }
+    if (native && (!list_empty(&sub->user_gotos) || !list_empty(&sub->user_labels))) {
+        yyerror(state, "user labels and goto currently require a GOOL-only subroutine");
+        g_was_error = true;
+    }
+    user_jump_point_t* jump;
+    list_for_each(&sub->user_gotos, jump) {
+        user_jump_point_t* target = NULL;
+        user_jump_point_t* candidate;
+        list_for_each(&sub->user_labels, candidate) {
+            if (strcmp(candidate->name, jump->name) || candidate->scope_count > jump->scope_count)
+                continue;
+            bool visible = true;
+            for (int i = 0; i < candidate->scope_count; ++i) {
+                if (candidate->scopes[i] != jump->scopes[i]) { visible = false; break; }
+            }
+
+            if (visible && (!target || candidate->scope_count > target->scope_count))
+                target = candidate;
+        }
+        const char* error = NULL;
+
+        if (!target) {
+            list_for_each(&sub->user_labels, candidate) {
+                if (strcmp(candidate->name, jump->name)) continue;
+
+                bool accessible = candidate->inline_owner == -1;
+                for (int i = 0; !accessible && i < jump->scope_count; ++i)
+                    if (jump->scopes[i] == candidate->inline_owner) accessible = true;
+                if (!accessible) continue;
+                if (target) {
+                    error = "ambiguous label outside visible scopes";
+                    break;
+                }
+                target = candidate;
+            }
+        }
+        if (!error && !target) error = "undefined label in accessible scopes";
+        if (!error && (target->saved_slots != jump->saved_slots ||
+                       target->save_owner != jump->save_owner))
+            error = "cannot cross a save() boundary";
+        if (!error) {
+            if (target->var_count > jump->var_count) error = "would skip local variable initialization";
+            for (int i = 0; !error && i < target->var_count; ++i)
+                if (target->vars[i] != jump->vars[i]) error = "destination has different live local variables";
+            if (!error && jump->var_count - target->var_count > 15) error = "pop count exceeds the GOOL limit of 15";
+        }
+        if (error) {
+            yyerror(state, "goto '%s' at line %d: %s", jump->name, jump->line, error);
+            g_was_error = true;
+            continue;
+        }
+        thecl_param_t* pop = jump->instr->params.head->next->data;
+        pop->value.val.S = jump->var_count - target->var_count;
+        thecl_param_t* dest = jump->instr->params.head->data;
+        free(dest->value.val.z);
+        dest->value.val.z = user_label_name(target->name, target->scopes[target->scope_count - 1]);
+        jump->resolved = true;
+        if (!native) user_goto_fold(state, jump);
+    }
+
+    list_for_each(&sub->user_gotos, jump) {
+        if (!jump->resolved) continue;
+        thecl_param_t* dest = jump->instr->params.head->data;
+        thecl_label_t* label;
+        list_for_each(&sub->labels, label) {
+            if (strcmp(label->name, dest->value.val.z)) continue;
+            int distance = label->offset - jump->instr->offset - 1;
+            if (distance < -512 || distance > 511) {
+                yyerror(state, "goto '%s' at line %d: displacement %d exceeds -512..511", jump->name, jump->line, distance);
+                g_was_error = true;
+            }
+            break;
+        }
+    }
+    list_t* points[] = { &sub->user_labels, &sub->user_gotos };
+    for (int i = 0; i < 2; ++i) {
+        user_jump_point_t* point;
+        list_for_each(points[i], point) {
+            free(point->name);
+            free(point->scopes);
+            free(point->vars);
+            free(point);
+        }
+        list_free_nodes(points[i]);
+    }
 }
 
 static void
@@ -5014,6 +5832,52 @@ anim_create_anim_c2(
     gool_anim_t* anim_header = malloc(sizeof(gool_anim_t));
     anim_header->name = strdup(name);
     anim_header->size = anim_size;
+    anim_header->anim = anim;
+    list_append_new(&state->main_ecl->anims, anim_header);
+}
+
+static bool
+anim_validate_name(parser_state_t* state, char* name)
+{
+    if (anim_get(state, name)) {
+        yyerror(state, "duplicate animation name: %s", name);
+        g_was_error = true;
+        return false;
+    }
+    return true;
+}
+
+static bool
+anim_validate_vertex(parser_state_t* state, char* name, int frames, unsigned int version)
+{
+    if (state->version != version) {
+        yyerror(state, "#anim %s: this declaration requires -c %u (C3 syntax: #anim name [anim] [model] frames interpolate raw-number)", name, version);
+        g_was_error = true;
+        return false;
+    }
+    if (frames < 0 || frames > UINT16_MAX) {
+        yyerror(state, "#anim %s: frame count must be in 0..65535", name);
+        g_was_error = true;
+        return false;
+    }
+    return anim_validate_name(state, name);
+}
+
+static void
+anim_create_anim_c3(parser_state_t* state, char* name, uint16_t frames,
+    int eid, int model, uint32_t interp, uint32_t number)
+{
+    c3_anim_t* anim = malloc(sizeof(*anim));
+    anim->type = 1;
+    anim->frames = frames;
+    anim->interp = interp;
+    anim->number = number;
+    anim->model = model;
+    anim->eid = eid;
+
+    gool_anim_t* anim_header = malloc(sizeof(*anim_header));
+    anim_header->name = strdup(name);
+    anim_header->size = sizeof(*anim);
     anim_header->anim = anim;
     list_append_new(&state->main_ecl->anims, anim_header);
 }

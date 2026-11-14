@@ -37,7 +37,16 @@
     #include "ecsparse.h"
     #include "util.h"
     #include "gool_ins.h"
-    void yyerror(parser_state_t*, const char*);
+    void yyerror(const parser_state_t*, const char*, ...);
+
+    static int checked_integer(const char* text, char** end, int base) {
+        unsigned long long value = strtoull(text, end, base);
+        if (value > UINT32_MAX) {
+            yyerror(g_parser_state, "integer literal exceeds 32 bits: %s", text);
+            g_was_error = true;
+        }
+        return (int)(uint32_t)value;
+    }
     /* yylloc.first_column is initialized to 1. */
     #define YY_USER_INIT yylloc.first_column = 0
     /* XXX: The builtin YY_INPUT does something with the newlines that doesn't
@@ -98,6 +107,8 @@
 "goto"     return GOTO;
 "unless"   return UNLESS;
 "if"       return IF;
+"accepteventif"|"accevif" return EVHAIF;
+"rejecteventif"|"rejevif" return EVHRIF;
 "else"     return ELSE;
 "do"       return DO;
 "while"    return WHILE;
@@ -173,6 +184,10 @@
 "entitygetstate"   return ENTITYSTATEGET;
 "gamefunc"         return GAMEFUNC;
 "getvalideventobj" return GETVALIDEVENTOBJ;
+"getfunc"  { yylval.integer = 15; return FUNCCONTEXT; }
+"setfunc"  { yylval.integer = 16; return FUNCCONTEXT; }
+"pushfunc" { yylval.integer = 17; return FUNCCONTEXT; }
+"miscfunc"         return MISCFUNC;
 "pointclip"        return POINTCLIP;
 "__unk2"           return UNK2;
 "isloaded"         return ISLOADED;
@@ -183,6 +198,9 @@
 "getglobal"        return GETGLOBAL;
 "autopal"          return AUTOPAL;
 "autontsc"         return AUTONTSC;
+"ins74"            return INS74;
+"ins76"            return INS76;
+"ins79"            return INS79;
 
 ([0-9]+\.([0-9]+)?|([0-9]+)?\.[0-9]+)([MmSsVv]|[Hh]z|deg)? {
     char* afternum;
@@ -205,7 +223,7 @@
 }
 [0-9]+([GgMmVvSs]|[Hh]z|deg)? {
     char* afternum;
-    yylval.integer = strtoul(yytext, &afternum, 10);
+    yylval.integer = checked_integer(yytext, &afternum, 10);
     if (strstr(afternum, "hz") || strstr(afternum, "Hz"))
         yylval.integer = (int)(yylval.integer / 11025.0 * 0x400);
     else if (strstr(afternum, "deg"))
@@ -236,12 +254,12 @@
     }
     else
         yylval.integer = 1;
-    yylval.integer *= strtoul(txt, NULL, 16);
+    yylval.integer *= checked_integer(txt, NULL, 16);
     return INTEGER;
 }
 0[bB][0-1]+ {
     bool hasSign = yytext[0] == '-' || yytext[0] == '+';
-    yylval.integer = strtoul(yytext + (hasSign ? 3 : 2), NULL, 2);
+    yylval.integer = checked_integer(yytext + (hasSign ? 3 : 2), NULL, 2);
     if (yytext[0] == '-') yylval.integer = -yylval.integer;
     return INTEGER;
 }
@@ -506,6 +524,7 @@
     return DIRECTIVE;
 }
 
+#anim     { return DIRECTIVE_ANIM; }
 #font     { return DIRECTIVE_FONT; }
 #char     { return DIRECTIVE_CHAR; }
 #text     { return DIRECTIVE_TEXT; }

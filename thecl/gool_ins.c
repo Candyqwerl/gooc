@@ -414,6 +414,22 @@ c1_gool_ins_settrans_params(
 }
 
 static list_t*
+c1_gool_ins_setevent_params(
+    list_t* params,
+    int argc)
+{
+    size_t c = list_count(params);
+    if (c == 1) {
+        list_append_new(params, param_val_new(field_get("epc")->offset));
+    }
+    else {
+        fprintf(stderr, "%s:%s:setevent: wrong number of arguments (expected 1, got %zu)\n", argv0, current_input, c);
+        return NULL;
+    }
+    return params;
+}
+
+static list_t*
 c1_gool_ins_setfield_params(
     list_t* params,
     int argc)
@@ -470,12 +486,15 @@ c1_gool_ins_entitysetspawn_params(
     thecl_param_t* param;
     size_t c = list_count(params);
     if (c == 1) {
-        list_prepend_new(params, param_val_new(field_get("player")->offset));
         list_prepend_new(params, param_var_new("id"));
+        c = 2;
+    }
+    if (c == 2) {
+        list_append_to(params, param_val_new(field_get("player")->offset), params->head);
         list_append_new(params, param_val_new(8));
     }
     else {
-        fprintf(stderr, "%s:%s:entitysetspawn: wrong number of arguments (expected 1, got %zu)\n", argv0, current_input, c);
+        fprintf(stderr, "%s:%s:entitysetspawn: wrong number of arguments (expected 1 or 2, got %zu)\n", argv0, current_input, c);
         return NULL;
     }
     return params;
@@ -1021,13 +1040,16 @@ c1_gool_ins_startgame_params(
     thecl_param_t* param;
     size_t c = list_count(params);
     if (c == 0) {
-        list_append_new(params, param_null_new());
         list_append_new(params, param_val_new(5));
+        c = 1;
+    }
+    if (c == 1) {
+        list_prepend_new(params, param_null_new());
         list_append_new(params, param_val_new(11));
         list_append_new(params, param_val_new(12));
     }
     else {
-        fprintf(stderr, "%s:%s:startgame: wrong number of arguments (expected 0, got %zu)\n", argv0, current_input, c);
+        fprintf(stderr, "%s:%s:startgame: wrong number of arguments (expected 0 or 1, got %zu)\n", argv0, current_input, c);
         return NULL;
     }
     return params;
@@ -1267,6 +1289,7 @@ c1_gool_ins[] = {
      /* NAME                        ID VA POP R   L              VALIDATE */
     { "onstateexit",                24, 0, 0, 0, -1, c1_gool_ins_onexit_params },
     { "settrans",                   24, 0, 0, 0, -1, c1_gool_ins_settrans_params },
+    { "setevent",                   24, 0, 0, 0, -1, c1_gool_ins_setevent_params },
     { "setfield",                   28, 2, 0, 0, -1, c1_gool_ins_setfield_params },
     { "entitysetspawn",             28, 0, 0, 0, -1, c1_gool_ins_entitysetspawn_params },
     { "movetozone",                 28, 0, 0, 0, -1, c1_gool_ins_movetozone_params },
@@ -1377,6 +1400,23 @@ c2_gool_ins_settrans_params(
 }
 
 static list_t*
+c2_gool_ins_setevent_params(
+    list_t* params,
+    int argc)
+{
+    size_t c = list_count(params);
+    if (c == 1) {
+        list_append_new(params, param_val_new(0));
+        list_append_new(params, param_val_new(field_get("epc")->offset));
+    }
+    else {
+        fprintf(stderr, "%s:%s:setevent: wrong number of arguments (expected 1, got %zu)\n", argv0, current_input, c);
+        return NULL;
+    }
+    return params;
+}
+
+static list_t*
 c2_gool_ins_call_params(
     list_t* params,
     int argc)
@@ -1448,16 +1488,26 @@ c2_gool_ins_ins46_params(
 }
 
 static list_t*
-c2_gool_ins_ins72_params(
+c2_gool_ins_setval_params(
     list_t* params,
     int argc)
 {
-    thecl_param_t* param;
     size_t c = list_count(params);
-    if (c == 2) {
+    if (c != 2 || argc != 1) {
+        fprintf(stderr, "%s:%s:setval: wrong number of arguments (expected 3, got %zu)\n", argv0, current_input, c + argc);
+        return NULL;
     }
-    else {
-        fprintf(stderr, "%s:%s:ins72: wrong number of arguments (expected 2, got %zu)\n", argv0, current_input, c);
+    return params;
+}
+
+static list_t*
+c2_gool_ins_two_arg_raw_params(
+    list_t* params,
+    int argc)
+{
+    size_t c = list_count(params);
+    if (c != 2) {
+        fprintf(stderr, "%s:%s:raw instruction: wrong number of arguments (expected 2, got %zu)\n", argv0, current_input, c);
         return NULL;
     }
     return params;
@@ -1485,9 +1535,10 @@ c2_gool_ins_killvictims_params(
 
 static const gool_ins_t
 c2_gool_ins[] = {
-     /* NAME                        ID VA POP R   L              VALIDATE */
+    /* NAME                         ID VA POP R   L              VALIDATE */
     { "onstateexit",                24, 0, 0, 0, -1, c2_gool_ins_onexit_params },
     { "settrans",                   24, 0, 0, 0, -1, c2_gool_ins_settrans_params },
+    { "setevent",                   24, 0, 0, 0, -1, c2_gool_ins_setevent_params },
     { "setfield",                   28, 2, 0, 0, -1, c1_gool_ins_setfield_params },
     { "entitysetspawn",             28, 0, 0, 0, -1, c1_gool_ins_entitysetspawn_params },
     { "entitysetstate",             28, 0, 0, 0, -1, c1_gool_ins_entitysetstate_params },
@@ -1508,6 +1559,7 @@ c2_gool_ins[] = {
     { "setcolor",                   36, 0, 0, 0, -1, c1_gool_ins_setcolor_params },
     { "anim",                       39, 0, 0, 0, -1, c1_gool_ins_anim_params },
     { "nop",                        47, 0, 0, 0, -1, c1_gool_ins_nop_params },
+    { "print",                      48, 0, 0, 0, -1, c2_gool_ins_two_arg_raw_params },
     { "changestate",                53, 1, 0, 0, -1, c1_gool_ins_state_params },
     { "changestateif",              54, 2, 0, 0,  1, c1_gool_ins_stateif_params },
     { "changestateifn",             55, 2, 0, 0,  1, c1_gool_ins_stateifn_params },
@@ -1559,7 +1611,91 @@ c2_gool_ins[] = {
     { "spawn2",                     70, 3, 0, 0, -1, c1_gool_ins_spawn_params },
     { "call",                       71, 1, 0, 0, -1, c2_gool_ins_call_params },
     { "ins46",                      46, 0, 0, 0, -1, c2_gool_ins_ins46_params },
-    { "ins72",                      72, 0, 0, 0, -1, c2_gool_ins_ins72_params },
+    { "setval",                     78, 2, 0, 0, -1, c2_gool_ins_setval_params },
+    { "ins72",                      72, 0, 0, 0, -1, c2_gool_ins_two_arg_raw_params },
+    { "ins74",                      74, 0, 0, 0, -1, c2_gool_ins_two_arg_raw_params },
+    { "ins75",                      75, 0, 0, 0, -1, c2_gool_ins_two_arg_raw_params },
+    { "ins76",                      76, 0, 0, 0, -1, c2_gool_ins_two_arg_raw_params },
+    { "ins77",                      77, 2, 0, 0, -1, c2_gool_ins_two_arg_raw_params },
+    { NULL, 0, 0, 0, 0, 0, NULL }
+};
+
+static list_t*
+c3_gool_ins_movetolist_params(list_t* params, int argc)
+{
+    size_t count = list_count(params);
+    if (count == 1)
+        return c1_gool_ins_movetolist_params(params, argc);
+    if (count != 2) {
+        fprintf(stderr, "%s:%s:movetolist: expected 1 or 2 arguments, got %zu\n", argv0, current_input, count);
+        g_was_error = true;
+        return params;
+    }
+    thecl_param_t* target = params->head->next->data;
+    if (target->is_expression_param ||
+        !((target->val_type == PARAM_FIELD && target->object_link == 0) || target->val_type == PARAM_LITERAL) ||
+        (target->value.val.S < 0 || target->value.val.S > 7)) {
+        fprintf(stderr, "%s:%s:movetolist: target must be a linkfield (self through interrupter)\n", argv0, current_input);
+        g_was_error = true;
+        return params;
+    }
+    list_append_new(params, param_val_new(2));
+    list_append_new(params, param_val_new(12));
+    return params;
+}
+
+static list_t*
+c3_gool_ins_spawn_params(list_t* params, int argc)
+{
+    params = c1_gool_ins_spawn_params(params, argc);
+    if (params) {
+        thecl_param_t* subtype = params->head->next->data;
+        if (subtype->val_type == PARAM_LITERAL)
+            subtype->value.val.S &= 0xFFFF;
+    }
+    return params;
+}
+
+static list_t*
+c3_gool_ins_getvert_params(list_t* params, int argc)
+{
+    size_t c = list_count(params);
+    int operation = 6;
+    if (c != 3 && c != 4) {
+        fprintf(stderr, "%s:%s:getvert: wrong number of arguments (expected 3 or 4, got %zu)\n", argv0, current_input, c);
+        return NULL;
+    }
+    if (c == 4) {
+        thecl_param_t* mode = params->tail->data;
+        if (mode->val_type != PARAM_LITERAL || (mode->value.val.S != 3 && mode->value.val.S != 6)) {
+            fprintf(stderr, "%s:%s:getvert: operation must be a constant 3 or 6\n", argv0, current_input);
+            return NULL;
+        }
+        operation = mode->value.val.S;
+        list_del(params, params->tail);
+        param_free(mode);
+    }
+    params = c1_gool_ins_getvert_params(params, argc);
+    if (params) {
+        thecl_param_t* mode = params->tail->prev->data;
+        mode->value.val.S = operation;
+    }
+    return params;
+}
+
+static const gool_ins_t c3_gool_ins[] = {
+    { "getvert", 58, 0, 0, 0, -1, c3_gool_ins_getvert_params },
+    { "misc5", 28, 0, 0, 0, -1, NULL },
+    { "print", 48, 0, 0, 0, -1, c2_gool_ins_two_arg_raw_params },
+    { "movetolist", 28, 0, 0, 0, -1, c3_gool_ins_movetolist_params },
+
+    { "getrank", 28, 0, 0, 0, -1, NULL },
+    { "setrank", 28, 0, 0, 0, -1, NULL },
+    { "spawn",  63, 3, 0, 0, -1, c3_gool_ins_spawn_params },
+    { "spawn2", 70, 3, 0, 0, -1, c3_gool_ins_spawn_params },
+    { "ins79", 79, 0, 0, 0, -1, c2_gool_ins_two_arg_raw_params },
+    { "ins80", 80, 0, 0, 0, -1, c2_gool_ins_two_arg_raw_params },
+    { "ins81", 81, 0, 0, 0, -1, c2_gool_ins_two_arg_raw_params },
     { NULL, 0, 0, 0, 0, 0, NULL }
 };
 
@@ -1568,7 +1704,7 @@ gool_ins_get_by_name_from_table(
     const gool_ins_t* table,
     char* name)
 {
-    while (table->name) {
+    while (table && table->name) {
         if (!strcmp(table->name, name))
             return table;
         ++table;
@@ -1587,6 +1723,10 @@ gool_ins_get_by_name(
 
     switch (version)
     {
+    case 3:
+        ret = gool_ins_get_by_name_from_table(c3_gool_ins, name);
+        if (ret) return ret;
+        /* fall through */
     case 2: table = c2_gool_ins; break;
     case 1: table = c1_gool_ins; break;
     }
@@ -1601,7 +1741,7 @@ gool_ins_get_by_id_from_table(
     const gool_ins_t* table,
     uint8_t id)
 {
-    while (table->name) {
+    while (table && table->name) {
         if (table->id == id)
             return table;
         ++table;
@@ -1620,6 +1760,10 @@ gool_ins_get_by_id(
 
     switch (version)
     {
+    case 3:
+        ret = gool_ins_get_by_id_from_table(c3_gool_ins, id);
+        if (ret) return ret;
+        /* fall through */
     case 2: table = c2_gool_ins; break;
     case 1: table = c1_gool_ins; break;
     }

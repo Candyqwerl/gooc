@@ -1,31 +1,4 @@
-/*
- * Redistribution and use in source and binary forms, with
- * or without modification, are permitted provided that the
- * following conditions are met:
- *
- * 1. Redistributions of source code must retain this list
- *    of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce this
- *    list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the
- *    distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
- * CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED
- * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
- * PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
- * COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT,
- * INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO,
- * PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
- * DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE
- * OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH
- * DAMAGE.
- */
+
 #ifndef THECL_H_
 #define THECL_H_
 
@@ -116,6 +89,7 @@ typedef struct {
     size_t var_count;
     field_t** vars;
 
+    int interrupt_count_override; 
     list_t interrupts;
     list_t spawns;
 
@@ -130,6 +104,7 @@ typedef struct {
 typedef struct {
     char* name;
     int stack;
+    int save_offset; 
     int scope;
     bool is_unused;
     bool is_written;
@@ -151,7 +126,9 @@ enum expression_type {
     EXPRESSION_XVAL,
     EXPRESSION_GLOBAL,
     EXPRESSION_COLOR,
-    EXPRESSION_TERNARY
+    EXPRESSION_TERNARY,
+    EXPRESSION_POINTCLIP_GETVERT,
+    EXPRESSION_EMBEDDED_GOOL_INS
 };
 
 typedef struct expression_t {
@@ -180,7 +157,10 @@ enum thecl_line_type {
     LINE_VAR_DECL,
     LINE_VAR_DECL_ASSIGN,
     LINE_GOTO,
+    LINE_USER_LABEL,
+    LINE_USER_GOTO,
     LINE_SCOPE_START,
+    LINE_INLINE_SCOPE_START,
     LINE_SCOPE_END,
     LINE_BREAK,
     LINE_CONTINUE,
@@ -234,6 +214,8 @@ typedef struct {
     list_t instrs;
     list_t labels;
     list_t lines;
+    list_t user_labels;
+    list_t user_gotos;
 
     uint16_t offset;
     uint16_t start_offset;
@@ -267,7 +249,7 @@ typedef enum {
 } thecl_state_sub_type;
 
 typedef struct {
-    enum thecl_interrupt_type type;
+    thecl_interrupt_type type;
     char* lambda_name;
 } thecl_state_sub_t;
 
@@ -297,7 +279,7 @@ typedef struct {
 
 typedef struct {
     const field_t* event;
-    enum thecl_interrupt_type type;
+    thecl_interrupt_type type;
     char* lambda_name;
 } thecl_interrupt_t;
 
@@ -318,7 +300,14 @@ typedef struct {
     int id;
     bool mips;
     bool returned;
+    int saved_slots; 
+    int inline_owner; 
 } thecl_scope_t;
+
+typedef struct {
+    char* name;
+    int stack_slots;
+} gooc_loop_frame_t;
 
 typedef struct {
     unsigned int version;
@@ -330,6 +319,7 @@ typedef struct {
     bool force_mips; /* Fuck this. */
     list_t addresses;
     list_t block_stack;
+    list_t loop_frames;
     thecl_scope_t* scope_stack;
     int scope_cnt;
     int scope_id;
@@ -370,7 +360,7 @@ typedef struct {
     parser_state_t* (*parse)(FILE* stream, char* filename, unsigned int ver);
     int (*compile)(const parser_state_t* ecl, FILE* stream);
 
-    void (*create_header)(const thecl_t* ecl, FILE* stream);
+    int (*create_header)(const thecl_t* ecl, FILE* stream);
 } thecl_module_t;
 
 /* Param functions */
@@ -386,6 +376,9 @@ thecl_param_t* param_sp2_new(void);
 thecl_param_t* param_val_new(int val);
 thecl_param_t* param_var_new(char* var);
 thecl_param_t* param_null_new(void);
+
+
+uint32_t gool_spawn_value(const thecl_t* gool, const thecl_spawn_t* spawn);
 
 /* Miscellaneous version functions */
 

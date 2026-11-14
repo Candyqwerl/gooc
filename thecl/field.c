@@ -520,6 +520,7 @@ color_get(
     const field_t* ret = NULL;
 
     switch (version) {
+    case 3: 
     case 2: ret = field_get_from_table(c2_colors, name); break;
     case 1: ret = field_get_from_table(c1_colors, name); break;
     }
@@ -535,6 +536,7 @@ global_get(
     const field_t* ret = NULL;
 
     switch (version) {
+    case 3: 
     case 2: ret = field_get_from_table(c2_globals, name); break;
     case 1: ret = field_get_from_table(c1_globals, name); break;
     }
@@ -559,6 +561,7 @@ event_get(
     const field_t* ret = NULL;
 
     switch (version) {
+    case 3: 
     case 2: ret = field_get_from_table(c2_events, name); break;
     case 1: ret = field_get_from_table(c1_events, name); break;
     }

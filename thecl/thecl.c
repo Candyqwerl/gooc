@@ -88,6 +88,7 @@ sin_psx(
 
 extern const thecl_module_t c1_gool;
 extern const thecl_module_t c2_gool;
+extern const thecl_module_t c3_gool;
 
 bool g_was_error = false;
 
@@ -101,6 +102,7 @@ thecl_new(
     list_init(&ecl->anims);
     list_init(&ecl->spawns);
     list_init(&ecl->interrupts);
+    ecl->interrupt_count_override = -1;
     ecl->vars = malloc(0);
     ecl->consts = malloc(0);
     ecl->eids = malloc(0);
@@ -177,9 +179,11 @@ thecl_free(
                 }
                 break;
             case LINE_LABEL:
+            case LINE_USER_LABEL:
                 free(line->label);
                 break;
             case LINE_GOTO:
+            case LINE_USER_GOTO:
                 if (line->go.expr) expression_free(line->go.expr);
                 free(line->go.label);
                 break;
@@ -506,7 +510,7 @@ expression_free(
     expression_t* expr)
 {
     expression_t* child_expr;
-    if (expr->type == EXPRESSION_OP || expr->type == EXPRESSION_TERNARY) {
+    if (expr->type == EXPRESSION_OP || expr->type == EXPRESSION_TERNARY || expr->type == EXPRESSION_POINTCLIP_GETVERT || expr->type == EXPRESSION_EMBEDDED_GOOL_INS) {
         list_for_each(&expr->children, child_expr)
             expression_free(child_expr);
         list_free_nodes(&expr->children);
@@ -637,6 +641,13 @@ line_make_save_end(void)
     thecl_line_t* line = calloc(1, sizeof(thecl_line_t));
     line->type = LINE_SAVE_END;
     return line;
+}
+
+uint32_t
+gool_spawn_value(const thecl_t* gool, const thecl_spawn_t* spawn)
+{
+    uint32_t value = (uint32_t)spawn->offset;
+    return gool->version == 3 ? ((uint32_t)gool->id << 16) | value : value;
 }
 
 int
@@ -798,7 +809,7 @@ print_usage(void)
            "  -h  set the output path for a \"header\" file which contains definitions for spawns and the GOOL ID\n"
            "  -e  set the output path format for external GOOL modules, where the first parameter is the entry-name\n"
            "VERSION can be:\n"
-           "  1, 2\n"
+           "  1, 2, 3\n"
            "LEVEL can be:\n"
            "  Any valid ename character (0-9, a-z, A-Z, '_', '!')\n"
            "REGION can be:\n"
@@ -885,6 +896,9 @@ main(int argc, char* argv[])
     g_reg_blocks = malloc(0);
 
     switch (version) {
+    case 3:
+        module = &c3_gool;
+        break;
     case 2:
         module = &c2_gool;
         break;
@@ -930,10 +944,10 @@ main(int argc, char* argv[])
 #endif
             parser_state_t* parser = module->parse(in, argv[0], version);
             if (parser) {
-                if (parser->main_ecl->is_defined) {
-                    module->compile(parser, out);
+                if (!g_was_error && parser->main_ecl->is_defined) {
+                    if (!module->compile(parser, out)) g_was_error = true;
                 }
-                if (h_out) {
+                if (!g_was_error && h_out) {
                     module->create_header(parser->main_ecl, h_out);
                 }
                 thecl_free(parser->main_ecl);
