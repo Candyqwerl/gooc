@@ -2,7 +2,7 @@
 
 A fork of ManDude's [GOOC](https://github.com/ManDude/gooc) compiler with various qol fixes, more instructions, and Crash 3 support.
 
-Vanilla GOOL scripts from Crash 2/3, translated into GOOC format for PAL, along with a precompiled compiler binary, can be found [here](link). 
+Vanilla GOOL scripts from Crash 2/3, translated into GOOC format for PAL, along with a precompiled compiler binary, can be found [here](https://github.com/Candyqwerl/gooc-dump.git). 
 
 ## Crash 3 support
 
